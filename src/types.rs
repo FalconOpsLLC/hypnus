@@ -223,3 +223,16 @@ pub type SetProcessValidCallTargetsFn = unsafe extern "system" fn(
     NumberOfOffsets: u32,
     OffsetInformation: *mut CFG_CALL_TARGET_INFO,
 ) -> u8;
+
+/// WaitForMultipleObjects return values
+pub const WAIT_OBJECT_0: u32 = 0x00000000;
+pub const WAIT_TIMEOUT: u32 = 0x00000102;
+pub const WAIT_FAILED: u32 = 0xFFFFFFFF;
+pub const INFINITE: u32 = 0xFFFFFFFF;
+
+pub type WaitForMultipleObjectsFn = unsafe extern "system" fn(
+    nCount: u32,
+    lpHandles: *const *mut c_void,
+    bWaitAll: i32,
+    dwMilliseconds: u32,
+) -> u32;

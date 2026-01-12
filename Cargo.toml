@@ -30,6 +30,18 @@ memchr = { version = "2.7.4", default-features = false }
 spin = { version = "0.10.0", default-features = false }
 windows-targets = "0.53.4"
 
+# Release profile optimized for minimal size and no debug artifacts
+[profile.release]
+opt-level = "z"             # Optimize for size (default)
+lto = true                  # Link-time optimization
+codegen-units = 1           # Single codegen unit for better optimization
+panic = "abort"             # Abort on panic (smaller than unwind)
+strip = true                # Strip symbols and debug info
+debug = false               # No debug info
+debug-assertions = false    # No debug assertions
+overflow-checks = false     # No overflow checks
+split-debuginfo = "off"     # Don't create external PDB
+
 [package.metadata.docs.rs]
 default-target = "x86_64-pc-windows-msvc"
 targets = [

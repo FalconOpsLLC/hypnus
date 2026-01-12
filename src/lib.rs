@@ -20,4 +20,5 @@ mod cfg;
 mod spoof;
 
 pub use hypnus::*;
+pub use types::{WAIT_OBJECT_0, WAIT_TIMEOUT, WAIT_FAILED, INFINITE};
 pub mod allocator;

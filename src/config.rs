@@ -35,6 +35,7 @@ pub struct Config {
     pub trampoline: u64,
     pub modules: Modules,
     pub wait_for_single: WinApi,
+    pub wait_for_multiple: WinApi,
     pub base_thread: WinApi,
     pub enum_date: WinApi,
     pub system_function040: WinApi,
@@ -193,6 +194,8 @@ impl Config {
         Self {
             modules,
             wait_for_single: get_proc_address(kernel32, 4186526855u32, Some(jenkins3)).into(),
+            // WaitForMultipleObjects: jenkins3 hash = 3963274078
+            wait_for_multiple: get_proc_address(kernel32, 3963274078u32, Some(jenkins3)).into(),
             base_thread: get_proc_address(kernel32, 4083630997u32, Some(murmur3)).into(),
             enum_date: get_proc_address(kernel32, 695401002u32, Some(jenkins3)).into(),
             system_function040: get_proc_address(cryptbase, 1777190324, Some(murmur3)).into(),

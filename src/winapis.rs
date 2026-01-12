@@ -146,6 +146,7 @@ pub struct Winapis {
     pub CreateFiber: CreateFiberFn,
     pub DeleteFiber: DeleteFiberFn,
     pub SwitchToFiber: SwitchToFiberFn,
+    pub WaitForMultipleObjects: WaitForMultipleObjectsFn,
 }
 
 /// Returns a reference to the resolved winapis structure.
@@ -183,6 +184,9 @@ pub fn winapis() -> &'static Winapis {
                 CreateFiber: transmute(get_proc_address(kernelbase, 620670734u32, Some(jenkins3))),
                 DeleteFiber: transmute(get_proc_address(kernelbase, 1500260625u32, Some(jenkins3))),
                 SwitchToFiber: transmute(get_proc_address(kernelbase, 954746181u32, Some(jenkins3))),
+                // WaitForMultipleObjects from kernel32
+                // Hash: jenkins3("WaitForMultipleObjects") = 0xEC43E75E = 3963274078
+                WaitForMultipleObjects: transmute(get_proc_address(kernel32, 3963274078u32, Some(jenkins3))),
             }
         }
     })
@@ -513,4 +517,15 @@ pub fn SwitchToFiber(lpFiber: *mut c_void) {
 /// Lightweight wrapper for `NtSetEvent`, used in a Threadpool callback context.
 pub extern "C" fn NtSetEvent2(_: *mut c_void, event: *mut c_void, _: *mut c_void, _: u32) {
     NtSetEvent(event, null_mut());
+}
+
+/// Wrapper for the `WaitForMultipleObjects` API.
+#[inline]
+pub fn WaitForMultipleObjects(
+    nCount: u32,
+    lpHandles: *const *mut c_void,
+    bWaitAll: i32,
+    dwMilliseconds: u32,
+) -> u32 {
+    unsafe { (winapis().WaitForMultipleObjects)(nCount, lpHandles, bWaitAll, dwMilliseconds) }
 }

