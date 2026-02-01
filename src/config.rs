@@ -33,6 +33,9 @@ pub struct Config {
     pub stack: StackSpoof,
     pub callback: u64,
     pub trampoline: u64,
+    /// Trampoline that wraps WaitForMultipleObjects and stores the return value.
+    /// This allows capturing the WFMO result in ROP chains where RAX would otherwise be lost.
+    pub wfmo_trampoline: u64,
     pub modules: Modules,
     pub wait_for_single: WinApi,
     pub wait_for_multiple: WinApi,
@@ -63,6 +66,7 @@ impl Config {
         cfg.stack = StackSpoof::new(&cfg)?;
         cfg.callback = Self::alloc_callback()?;
         cfg.trampoline = Self::alloc_trampoline()?;
+        cfg.wfmo_trampoline = Self::alloc_wfmo_trampoline()?;
 
         // Register Control Flow Guard function targets if enabled
         if let Ok(true) = is_cfg_enforced() {
@@ -156,6 +160,83 @@ impl Config {
 
         // Locks the specified region of virtual memory into physical memory,
         // preventing it from being paged to disk by the memory manager
+        NtLockVirtualMemory(NtCurrentProcess(), &mut addr, &mut size, VM_LOCK_1);
+        Ok(addr as u64)
+    }
+
+    /// Allocates a trampoline that wraps WaitForMultipleObjects and stores the result.
+    ///
+    /// This trampoline solves the WFMO return value race condition in ROP chains.
+    /// When called via NtContinue, the WFMO return value in RAX would normally be
+    /// overwritten by the next NtContinue call before it can be read.
+    ///
+    /// The trampoline takes 6 parameters:
+    /// - RCX: nCount
+    /// - RDX: lpHandles  
+    /// - R8:  bWaitAll
+    /// - R9:  dwMilliseconds
+    /// - [RSP+0x28]: result_ptr - pointer to u64 where result will be stored
+    /// - [RSP+0x30]: wfmo_addr - address of WaitForMultipleObjects
+    pub fn alloc_wfmo_trampoline() -> Result<u64> {
+        // Trampoline shellcode that:
+        // 1. Saves RBX and R12 (callee-saved)
+        // 2. Loads result_ptr and wfmo_addr from stack
+        // 3. Calls WaitForMultipleObjects
+        // 4. Stores RAX (result) to [result_ptr]
+        // 5. Restores registers and returns
+        //
+        // Stack layout when called:
+        //   [RSP]      = return address
+        //   [RSP+0x28] = result_ptr (5th param)
+        //   [RSP+0x30] = wfmo_addr (6th param)
+        //
+        // After push rbx, push r12, sub rsp 0x28:
+        //   [RSP+0x60] = result_ptr
+        //   [RSP+0x68] = wfmo_addr
+        let wfmo_trampoline: &[u8] = &[
+            0x53,                         // push rbx
+            0x41, 0x54,                   // push r12
+            0x48, 0x83, 0xEC, 0x28,       // sub rsp, 0x28
+            0x48, 0x8B, 0x5C, 0x24, 0x60, // mov rbx, [rsp+0x60] ; result_ptr
+            0x4C, 0x8B, 0x64, 0x24, 0x68, // mov r12, [rsp+0x68] ; wfmo_addr
+            0x41, 0xFF, 0xD4,             // call r12
+            0x48, 0x89, 0x03,             // mov [rbx], rax
+            0x48, 0x83, 0xC4, 0x28,       // add rsp, 0x28
+            0x41, 0x5C,                   // pop r12
+            0x5B,                         // pop rbx
+            0xC3,                         // ret
+        ];
+
+        // Allocate RW memory for trampoline
+        let mut size = wfmo_trampoline.len();
+        let mut addr = null_mut();
+        if !NT_SUCCESS(NtAllocateVirtualMemory(
+            NtCurrentProcess(),
+            &mut addr,
+            0,
+            &mut size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE
+        )) {
+            bail!(s!("failed to allocate WFMO trampoline memory"));
+        }
+
+        // Write trampoline bytes to allocated memory
+        unsafe { core::ptr::copy_nonoverlapping(wfmo_trampoline.as_ptr(), addr as *mut u8, wfmo_trampoline.len()) };
+
+        // Change protection to RX for execution
+        let mut old_protect = 0;
+        if !NT_SUCCESS(NtProtectVirtualMemory(
+            NtCurrentProcess(),
+            &mut addr,
+            &mut size,
+            PAGE_EXECUTE_READ as u32,
+            &mut old_protect
+        )) {
+            bail!(s!("failed to change WFMO trampoline memory protection to RX"));
+        }
+
+        // Lock the memory to prevent paging
         NtLockVirtualMemory(NtCurrentProcess(), &mut addr, &mut size, VM_LOCK_1);
         Ok(addr as u64)
     }

