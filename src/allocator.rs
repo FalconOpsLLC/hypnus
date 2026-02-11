@@ -1,7 +1,7 @@
 use core::{
     alloc::{GlobalAlloc, Layout},
     ffi::c_void,
-    ptr::{NonNull, null_mut},
+    ptr::null_mut,
     sync::atomic::{AtomicPtr, Ordering},
 };
 
@@ -9,7 +9,7 @@ use dinvk::types::HANDLE;
 use crate::types::HEAP_GROWABLE;
 
 /// Global handle to the custom heap used by `HypnusHeap`.
-static mut HEAP_HANDLE: Option<NonNull<c_void>> = None;
+static HEAP_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 
 /// External heap handle (set by implant for obfuscation compatibility).
 /// When set, this heap is used for heap walking during obfuscated sleep,
@@ -34,8 +34,11 @@ impl HypnusHeap {
             ) 
         };
         
-        let nonnull = unsafe { NonNull::new_unchecked(handle) };
-        unsafe { HEAP_HANDLE = Some(nonnull) };
+        if handle.is_null() {
+            return null_mut();
+        }
+        
+        HEAP_HANDLE.store(handle, Ordering::SeqCst);
         handle
     }
 
@@ -74,9 +77,11 @@ impl HypnusHeap {
         }
         
         // Fall back to internal heap
-        unsafe { 
-            HEAP_HANDLE.map(|p| p.as_ptr())
-                .unwrap_or_else(Self::create_heap) 
+        let handle = HEAP_HANDLE.load(Ordering::SeqCst);
+        if !handle.is_null() {
+            handle
+        } else {
+            Self::create_heap()
         }
     }
 }

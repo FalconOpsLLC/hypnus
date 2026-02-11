@@ -219,6 +219,9 @@ impl StackSpoof {
                     + cfg.stack.base_thread_size
                     + cfg.stack.rlt_acquire_srw_size
                     + 32) as u64;
+            
+            // Enforce 16-byte stack alignment (x64 ABI requirement)
+            ctx_spoof.Rsp &= !0xF;
 
             // Return to RtlAcquireSRWLockExclusive + 0x17 (after call)
             *(ctx_spoof.Rsp as *mut u64) = cfg.rtl_acquire_lock.as_u64().add(0x17);

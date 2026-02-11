@@ -46,7 +46,7 @@ pub struct Gadget {
 
 impl Gadget {
     /// Searches for usable `jmp <reg>` gadgets in memory based on predefined opcodes.
-    pub fn new(cfg: &Config) -> Self {
+    pub fn new(cfg: &Config) -> Option<Self> {
         let mut gadgets = Vec::new();
         let modules = [
             cfg.modules.ntdll.as_ptr() as *const u8,
@@ -64,14 +64,7 @@ impl Gadget {
 
         // Shuffle to reduce pattern predictability.
         shuffle(&mut gadgets);
-
-        if let Some(gadget) = gadgets.first().copied() {
-            gadget
-        } else {
-            // SAFETY: `gadgets` is guaranteed to be non-empty at this point due to prior validation.
-            // If this invariant is ever broken, this will invoke undefined behavior
-            unsafe { core::hint::unreachable_unchecked() }
-        }
+        gadgets.first().copied()
     }
 
     /// Injects this gadget into a given thread CONTEXT.
@@ -181,8 +174,9 @@ pub trait GadgetContext {
 
 impl GadgetContext for CONTEXT {
     fn jmp(&mut self, cfg: &Config, target: u64) {
-        let gadget = Gadget::new(cfg);
-        gadget.apply(self, target);
+        if let Some(gadget) = Gadget::new(cfg) {
+            gadget.apply(self, target);
+        }
     }
 }
 

