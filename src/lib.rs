@@ -18,7 +18,9 @@ mod winapis;
 mod gadget;
 mod cfg;
 mod spoof;
+mod stub_page;
 
 pub use hypnus::*;
+pub use config::set_stub_image_region;
 pub use types::{WAIT_OBJECT_0, WAIT_TIMEOUT, WAIT_FAILED, INFINITE};
 pub mod allocator;

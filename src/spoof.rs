@@ -17,6 +17,7 @@ use dinvk::{
 use crate::{Obfuscation, types::*};
 use crate::config::Config;
 use crate::gadget::{scan_runtime, GadgetKind};
+use crate::stub_page::StubPage;
 use crate::winapis::{
     NtLockVirtualMemory,
     NtAllocateVirtualMemory,
@@ -88,6 +89,60 @@ impl StackSpoof {
         let mut stack = Self::alloc_memory(cfg)?;
         stack.frames(cfg)?;
         Ok(stack)
+    }
+
+    /// Create a new `StackSpoof` using a shared stub page for the gadget code.
+    ///
+    /// This avoids creating a separate private RX page for the gadget code,
+    /// instead writing it into the shared stub page with all other trampolines.
+    #[inline]
+    pub fn new_with_stubs(cfg: &Config, stubs: &mut StubPage) -> Result<Self> {
+        let mut stack = Self::alloc_memory_shared(cfg, stubs)?;
+        stack.frames(cfg)?;
+        Ok(stack)
+    }
+
+    /// Allocates memory for spoofed stack execution using a shared stub page.
+    ///
+    /// The gadget code (e.g., `mov rsp, rbp; ret`) is written into the shared
+    /// page instead of getting its own private RX allocation.
+    /// The gadget pointer page (RW) is still allocated separately since it
+    /// holds a data pointer, not executable code.
+    pub fn alloc_memory_shared(cfg: &Config, stubs: &mut StubPage) -> Result<Self> {
+        // Check that the algo module contains a gadget `call [rbx]` or `jmp [rbx]`
+        let kind = GadgetKind::detect(cfg.modules.kernelbase.as_ptr())?;
+
+        // Write gadget code into the shared stub page (no separate RX allocation)
+        let bytes = kind.bytes();
+        let gadget_code_addr = stubs.write(bytes);
+
+        // Allocate pointer to gadget (RW page -- not executable, not flagged by scanners)
+        let mut gadget_ptr = null_mut();
+        let mut ptr_size = 1 << 12;
+        if !NT_SUCCESS(NtAllocateVirtualMemory(
+            NtCurrentProcess(), 
+            &mut gadget_ptr, 
+            0, 
+            &mut ptr_size, 
+            MEM_COMMIT | MEM_RESERVE, 
+            PAGE_READWRITE
+        )) {
+            bail!(s!("failed to allocate gadget pointer page"));
+        }
+
+        unsafe {
+            // Write the gadget address to the pointer page
+            *(gadget_ptr as *mut u64) = gadget_code_addr;
+
+            // Lock the pointer page into physical memory
+            NtLockVirtualMemory(NtCurrentProcess(), &mut gadget_ptr, &mut ptr_size, VM_LOCK_1);
+        }
+
+        Ok(Self {
+            gadget_rbp: gadget_ptr as u64,
+            gadget: kind,
+            ..Default::default()
+        })
     }
 
     /// Allocates memory required for spoofed stack execution.
