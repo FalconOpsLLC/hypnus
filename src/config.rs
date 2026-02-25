@@ -11,7 +11,7 @@ use dinvk::module::{
 };
 
 use crate::{
-    cfg::{is_cfg_enforced, register_cfg_targets},
+    cfg::register_cfg_targets,
     spoof::StackSpoof,
     stub_page::StubPage,
     winapis::*
@@ -76,6 +76,13 @@ pub struct Config {
     pub tp_release_cleanup: WinApi,
     pub rtl_capture_context: WinApi,
     pub zw_wait_for_worker: WinApi,
+    /// 16-byte aligned stub for NtSetEvent2 threadpool callback.
+    /// Replaces the raw Rust function pointer which may not be 16-byte aligned
+    /// and would fail CFG validation on stomped modules.
+    pub nt_set_event2_stub: u64,
+    /// 16-byte aligned JMP trampoline to the fiber entry function.
+    /// CFG requires indirect call targets to be 16-byte aligned.
+    pub fiber_trampoline: u64,
     /// Base address of the consolidated stub page (for all ROP trampolines/stubs).
     /// Stored for potential cleanup. All callback/trampoline/cipher/gadget addresses
     /// point into this single page.
@@ -121,6 +128,13 @@ impl Config {
         cfg.custom_encrypt = cipher;
         cfg.custom_decrypt = cipher;
 
+        cfg.nt_set_event2_stub = Self::write_nt_set_event2_stub(
+            &mut stubs, cfg.nt_set_event.as_u64(),
+        )?;
+        cfg.fiber_trampoline = Self::write_fiber_trampoline(
+            &mut stubs, crate::hypnus::hypnus_fiber_addr(),
+        )?;
+
         // Write stack spoof gadget into the shared page
         cfg.stack = StackSpoof::new_with_stubs(&cfg, &mut stubs)?;
 
@@ -128,10 +142,7 @@ impl Config {
         stubs.finalize()?;
         cfg.stub_page_base = stubs.base_addr();
 
-        // Register Control Flow Guard function targets if enabled
-        if let Ok(true) = is_cfg_enforced() {
-            register_cfg_targets(&cfg);
-        }
+        register_cfg_targets(&cfg);
 
         Ok(cfg)
     }
@@ -323,6 +334,27 @@ impl Config {
         shellcode.extend_from_slice(&key);
 
         Ok(stubs.write(&shellcode))
+    }
+
+    /// Writes a 16-byte aligned NtSetEvent2 replacement into the stub page.
+    /// Threadpool callback signature: (Instance*, Param*, Timer*) -- event handle is in rdx.
+    fn write_nt_set_event2_stub(stubs: &mut StubPage, nt_set_event: u64) -> Result<u64> {
+        let mut code = alloc::vec::Vec::with_capacity(20);
+        code.extend_from_slice(&[0x48, 0x89, 0xD1]);       // mov rcx, rdx (event handle → 1st param)
+        code.extend_from_slice(&[0x48, 0x31, 0xD2]);       // xor rdx, rdx (previous_state = NULL)
+        code.extend_from_slice(&[0x48, 0xB8]);              // mov rax, imm64
+        code.extend_from_slice(&nt_set_event.to_le_bytes());
+        code.extend_from_slice(&[0xFF, 0xE0]);              // jmp rax
+        Ok(stubs.write(&code))
+    }
+
+    /// Writes a 16-byte aligned JMP trampoline to the fiber entry function.
+    fn write_fiber_trampoline(stubs: &mut StubPage, fiber_fn: u64) -> Result<u64> {
+        let mut code = alloc::vec::Vec::with_capacity(16);
+        code.extend_from_slice(&[0x48, 0xB8]);              // mov rax, imm64
+        code.extend_from_slice(&fiber_fn.to_le_bytes());
+        code.extend_from_slice(&[0xFF, 0xE0]);              // jmp rax
+        Ok(stubs.write(&code))
     }
 
     /// Resolves the base addresses of key Windows modules (`ntdll.dll`, `kernel32.dll`, etc).

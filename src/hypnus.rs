@@ -20,6 +20,7 @@ use crate::config::{Config, init_config, current_rsp};
 use crate::gadget::GadgetContext;
 use crate::allocator::HypnusHeap;
 
+
 /// Initiates execution obfuscation using the `TpSetTimer`.
 ///
 /// # Example
@@ -473,7 +474,7 @@ impl WakeReason {
 
 /// Structure responsible for centralizing memory obfuscation techniques
 #[derive(Clone, Copy, Debug)]
-struct Hypnus {
+pub(crate) struct Hypnus {
     /// Base memory pointer to be manipulated or operated on.
     base: u64,
 
@@ -667,7 +668,7 @@ impl Hypnus {
             let mut timer_event = null_mut();
             status = TpAllocTimer(
                 &mut timer_event, 
-                NtSetEvent2 as *mut c_void, 
+                self.cfg.nt_set_event2_stub as *mut c_void, 
                 events[0], 
                 &mut env
             );
@@ -960,7 +961,7 @@ impl Hypnus {
             let mut wait_event = null_mut();
             status = TpAllocWait(
                 &mut wait_event, 
-                NtSetEvent2 as *mut c_void, 
+                self.cfg.nt_set_event2_stub as *mut c_void, 
                 events[1], 
                 &mut env
             );
@@ -1453,10 +1454,14 @@ pub mod __private {
                     wfmo_result_ptr: null_mut(), // No handle-based wait
                 });
 
-                // Creates a new fiber with 1MB stack, pointing to the `hypnus_fiber` function.
+                let cfg = crate::config::init_config().ok();
+                let fiber_proc: unsafe extern "system" fn(*mut c_void) = unsafe {
+                    core::mem::transmute(cfg.map_or(hypnus_fiber as *const () as u64, |c| c.fiber_trampoline))
+                };
+
                 let fiber = CreateFiber(
                     0x100000, 
-                    Some(hypnus_fiber), 
+                    Some(fiber_proc), 
                     Box::into_raw(fiber_ctx).cast()
                 );
                 
@@ -1498,24 +1503,19 @@ pub mod __private {
 
         match Hypnus::new_with_wait(base as u64, size, wait, mode) {
             Ok(hypnus) => {
-                // Storage for WFMO result - initialized to WAIT_TIMEOUT as fallback.
-                // The WFMO trampoline will store the actual result here during ROP execution.
                 let mut wfmo_result: u64 = WAIT_TIMEOUT as u64;
                 
-                // Determine handle count for wake reason conversion
                 let handle_count = match wait {
                     WaitPrimitive::Timeout { .. } => 0,
                     WaitPrimitive::Handles { count, .. } => count,
                 };
                 
-                // Set result pointer only for handle-based waits
                 let wfmo_result_ptr = if handle_count > 0 {
                     &mut wfmo_result as *mut u64
                 } else {
                     null_mut()
                 };
                 
-                // Creates the context to be passed into the new fiber.
                 let fiber_ctx = Box::new(FiberContext {
                     hypnus: Box::new(hypnus),
                     obf,
@@ -1523,10 +1523,14 @@ pub mod __private {
                     wfmo_result_ptr,
                 });
 
-                // Creates a new fiber with 1MB stack, pointing to the `hypnus_fiber` function.
+                let cfg = crate::config::init_config().ok();
+                let fiber_proc: unsafe extern "system" fn(*mut c_void) = unsafe {
+                    core::mem::transmute(cfg.map_or(hypnus_fiber as *const () as u64, |c| c.fiber_trampoline))
+                };
+
                 let fiber = CreateFiber(
                     0x100000, 
-                    Some(hypnus_fiber), 
+                    Some(fiber_proc), 
                     Box::into_raw(fiber_ctx).cast()
                 );
                 
@@ -1558,39 +1562,43 @@ pub mod __private {
         }
     }
 
-    /// Structure passed to the fiber containing the [`Hypnus`].
-    struct FiberContext {
-        hypnus: Box<Hypnus>,
-        obf: Obfuscation,
-        master: *mut c_void,
-        /// Pointer to storage for WaitForMultipleObjects result.
-        /// When non-null, the WFMO trampoline stores the result here during ROP chain execution.
-        /// This solves the race condition where RAX would be lost before we could read it.
-        wfmo_result_ptr: *mut u64,
-    }
+}
 
-    /// Trampoline function executed inside the fiber.
-    ///
-    /// It unpacks the `FiberContext`, runs the selected obfuscation method,
-    /// and optionally logs errors in debug mode.
-    extern "system" fn hypnus_fiber(ctx: *mut c_void) {
-        unsafe {
-            let mut ctx = Box::from_raw(ctx as *mut FiberContext);
-            let wfmo_result_ptr = ctx.wfmo_result_ptr;
-            let _result = match ctx.obf {
-                Obfuscation::Timer   => ctx.hypnus.timer(wfmo_result_ptr),
-                Obfuscation::Wait    => ctx.hypnus.wait(wfmo_result_ptr),
-                Obfuscation::Foliage => ctx.hypnus.foliage(wfmo_result_ptr),
-            };
+/// Context passed to the fiber entry function.
+struct FiberContext {
+    hypnus: alloc::boxed::Box<Hypnus>,
+    obf: Obfuscation,
+    master: *mut c_void,
+    wfmo_result_ptr: *mut u64,
+}
 
-            #[cfg(debug_assertions)]
-            if let Err(_error) = _result {
-                dinvk::println!("[Hypnus] {:?}", _error);
-            }
+/// Trampoline function executed inside the fiber.
+///
+/// Unpacks the `FiberContext`, runs the selected obfuscation method,
+/// and switches back to the master fiber.
+/// Defined as a standalone function so its address is accessible for CFG trampolines.
+pub(crate) extern "system" fn hypnus_fiber(ctx: *mut c_void) {
+    unsafe {
+        let mut ctx = alloc::boxed::Box::from_raw(ctx as *mut FiberContext);
+        let wfmo_result_ptr = ctx.wfmo_result_ptr;
+        let _result = match ctx.obf {
+            Obfuscation::Timer   => ctx.hypnus.timer(wfmo_result_ptr),
+            Obfuscation::Wait    => ctx.hypnus.wait(wfmo_result_ptr),
+            Obfuscation::Foliage => ctx.hypnus.foliage(wfmo_result_ptr),
+        };
 
-            SwitchToFiber(ctx.master);
+        #[cfg(debug_assertions)]
+        if let Err(_error) = _result {
+            dinvk::println!("[Hypnus] {:?}", _error);
         }
+
+        SwitchToFiber(ctx.master);
     }
+}
+
+/// Returns the address of the fiber entry function for stub page trampolines.
+pub(crate) fn hypnus_fiber_addr() -> u64 {
+    hypnus_fiber as *const () as u64
 }
 
 trait Asu64 {
