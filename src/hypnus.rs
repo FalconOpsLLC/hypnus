@@ -1308,11 +1308,9 @@ impl Hypnus {
                         // Direct WFMO call (result will be lost)
                         ctxs[5].Rip = self.cfg.wait_for_multiple.into();
                     }
-                    ctxs[5].Rcx = count as u64;
-                    ctxs[5].Rdx = handle_storage.as_ptr() as u64;
-                    ctxs[5].R8  = 0; // bWaitAll = FALSE
-                    ctxs[5].R9  = timeout_ms as u64;
-                    // 5th and 6th params (result_ptr, wfmo_addr) are written after spoof()
+                    ctxs[5].Rcx = handles[0] as u64; // pipe event handle
+                    ctxs[5].Rdx = timeout_ms as u64;
+                    ctxs[5].R8  = 0;
                 }
             }
 
