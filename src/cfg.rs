@@ -156,7 +156,6 @@ pub fn register_cfg_targets(cfg: &Config) {
     add_cfg_for_stub(cfg.custom_encrypt, "encrypt");
     add_cfg_for_stub(cfg.callback, "callback");
     add_cfg_for_stub(cfg.trampoline, "trampoline");
-    add_cfg_for_stub(cfg.wfmo_trampoline, "wfmo_tramp");
     add_cfg_for_stub(cfg.nt_set_event2_stub, "NtSetEvent2_stub");
     add_cfg_for_stub(cfg.fiber_trampoline, "fiber_tramp");
 

@@ -137,6 +137,8 @@ pub struct Winapis {
     pub TpSetTimer: TpSetTimerFn,
     pub TpAllocWait: TpAllocFn,
     pub TpSetWait: TpSetWaitFn,
+    pub TpWaitForWait: TpWaitForWaitFn,
+    pub TpReleaseWait: TpReleaseWaitFn,
     pub NtSetEvent: NtSetEventFn,
     pub CloseThreadpool: CloseThreadpoolFn,
     pub RtlWalkHeap: RtlWalkHeapFn,
@@ -175,6 +177,8 @@ pub fn winapis() -> &'static Winapis {
                 TpSetTimer: transmute(get_proc_address(ntdll, 3984996346u32, Some(jenkins3))),
                 TpAllocWait: transmute(get_proc_address(ntdll, 1490509702u32, Some(jenkins3))),
                 TpSetWait: transmute(get_proc_address(ntdll, 47310713u32, Some(jenkins3))),
+                TpWaitForWait: transmute(get_proc_address(ntdll, 360484582u32, Some(jenkins3))),
+                TpReleaseWait: transmute(get_proc_address(ntdll, 2946710062u32, Some(jenkins3))),
                 NtSetEvent: transmute(get_proc_address(ntdll, 1943906260u32, Some(jenkins3))),
                 CloseThreadpool: transmute(get_proc_address(kernel32, 4211127317u32, Some(jenkins3))),
                 RtlWalkHeap: transmute(get_proc_address(ntdll, 428298494u32, Some(jenkins3))),
@@ -185,8 +189,8 @@ pub fn winapis() -> &'static Winapis {
                 DeleteFiber: transmute(get_proc_address(kernelbase, 1500260625u32, Some(jenkins3))),
                 SwitchToFiber: transmute(get_proc_address(kernelbase, 954746181u32, Some(jenkins3))),
                 // WaitForMultipleObjects from kernel32
-                // Hash: jenkins3("WaitForMultipleObjects") = 0xEC43E75E = 3963274078
-                WaitForMultipleObjects: transmute(get_proc_address(kernel32, 3963274078u32, Some(jenkins3))),
+                // Hash: jenkins3("WaitForMultipleObjects") = 0xAC7FEDBA = 2893429114
+                WaitForMultipleObjects: transmute(get_proc_address(kernel32, 2893429114u32, Some(jenkins3))),
             }
         }
     })
@@ -446,6 +450,27 @@ pub fn TpAllocWait(
 #[inline]
 pub fn TpSetWait(Wait: *mut c_void, Handle: *mut c_void, Timeout: *mut LARGE_INTEGER) {
     unsafe { (winapis().TpSetWait)(Wait, Handle, Timeout) }
+}
+
+/// Wrapper for the `TpWaitForWait` API.
+///
+/// Drains outstanding callbacks for the wait object. Pass a non-zero
+/// `CancelPendingCallbacks` to cancel callbacks that have been queued but
+/// have not yet started running. Already-running callbacks are waited on
+/// regardless. Must be called before `TpReleaseWait` or `CloseThreadpool`
+/// when the wait may still have pending callbacks.
+#[inline]
+pub fn TpWaitForWait(Wait: *mut c_void, CancelPendingCallbacks: i32) {
+    unsafe { (winapis().TpWaitForWait)(Wait, CancelPendingCallbacks) }
+}
+
+/// Wrapper for the `TpReleaseWait` API.
+///
+/// Frees the wait object. Must be preceded by `TpWaitForWait` if the wait
+/// may still have outstanding callbacks.
+#[inline]
+pub fn TpReleaseWait(Wait: *mut c_void) {
+    unsafe { (winapis().TpReleaseWait)(Wait) }
 }
 
 /// Wrapper for the `CloseThreadpool` API.

@@ -21,6 +21,11 @@ include = [
 [lib]
 doctest = false
 
+[features]
+# Diagnostic — emit OutputDebugStringA markers from the HandleBridge path.
+# Lab-only; do not enable for production builds.
+debug_bridge = []
+
 [dependencies]
 obfstr = "0.4.4"
 dinvk = "0.4.2"

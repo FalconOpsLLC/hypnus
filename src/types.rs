@@ -131,6 +131,11 @@ pub type TpAllocPoolFn = unsafe extern "system" fn(PoolReturn: *mut *mut c_void,
 pub type TpSetPoolMaxThreadsFn = unsafe extern "system" fn(Pool: *mut c_void, MaxThreads: u32);
 pub type TpSetPoolMinThreadsFn = unsafe extern "system" fn(Pool: *mut c_void, MinThreads: u32) -> NTSTATUS;
 pub type TpSetWaitFn = unsafe extern "system" fn(Wait: *mut c_void, Handle: *mut c_void, Timeout: *mut LARGE_INTEGER);
+/// Drains outstanding callbacks for a TP_WAIT. Second arg cancels pending (not-yet-running)
+/// callbacks when non-zero. Must be called before `TpReleaseWait` or `CloseThreadpool` when
+/// the wait object may still have pending callbacks.
+pub type TpWaitForWaitFn = unsafe extern "system" fn(Wait: *mut c_void, CancelPendingCallbacks: i32);
+pub type TpReleaseWaitFn = unsafe extern "system" fn(Wait: *mut c_void);
 pub type TpAllocFn = unsafe extern "system" fn(
     Timer: *mut *mut c_void,
     Callback: *mut c_void,
