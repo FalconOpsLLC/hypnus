@@ -71,25 +71,11 @@ pub fn add_cfg_standalone(function: usize) -> Result<()> {
     Ok(())
 }
 
-/// Find the PE module base by scanning backwards from an address for the MZ header.
-fn find_module_base(addr: usize) -> Option<usize> {
-    let mut base = addr & !0xFFF;
-    for _ in 0..2048 {
-        if base < 0x1000 { break; }
-        unsafe {
-            let sig = *(base as *const u16);
-            if sig == 0x5A4D {
-                return Some(base);
-            }
-        }
-        base -= 0x1000;
-    }
-    None
-}
-
 /// Register a stub address as a valid CFG target.
-/// For image-backed stubs (inside a PE module), uses module-level registration.
-/// For standalone allocations, uses page-level registration.
+///
+/// Do not scan backward for an `MZ` header here. The fallback/private stub page
+/// is often surrounded by uncommitted pages, and probing those pages can fault
+/// during `Config::new()` before the fiber is even created.
 fn add_cfg_for_stub(addr: u64, _label: &str) {
     if addr == 0 {
         if cfg!(debug_assertions) {
@@ -99,33 +85,16 @@ fn add_cfg_for_stub(addr: u64, _label: &str) {
     }
     let addr_usize = addr as usize;
 
-    if let Some(module_base) = find_module_base(addr_usize) {
-        match add_cfg(module_base, addr_usize) {
-            Ok(()) => {
-                if cfg!(debug_assertions) {
-                    dinvk::println!("[CFG] OK {}: 0x{:x} (mod 0x{:x}, off 0x{:x})",
-                        _label, addr_usize, module_base, addr_usize - module_base);
-                }
-            }
-            Err(_e) => {
-                if cfg!(debug_assertions) {
-                    dinvk::println!("[CFG] FAIL {}: 0x{:x} (mod 0x{:x}) - {}",
-                        _label, addr_usize, module_base, _e);
-                }
+    match add_cfg_standalone(addr_usize) {
+        Ok(()) => {
+            if cfg!(debug_assertions) {
+                dinvk::println!("[CFG] OK {} (standalone): 0x{:x}", _label, addr_usize);
             }
         }
-    } else {
-        match add_cfg_standalone(addr_usize) {
-            Ok(()) => {
-                if cfg!(debug_assertions) {
-                    dinvk::println!("[CFG] OK {} (standalone): 0x{:x}", _label, addr_usize);
-                }
-            }
-            Err(_e) => {
-                if cfg!(debug_assertions) {
-                    dinvk::println!("[CFG] FAIL {} (standalone): 0x{:x} - {}",
-                        _label, addr_usize, _e);
-                }
+        Err(_e) => {
+            if cfg!(debug_assertions) {
+                dinvk::println!("[CFG] FAIL {} (standalone): 0x{:x} - {}",
+                    _label, addr_usize, _e);
             }
         }
     }

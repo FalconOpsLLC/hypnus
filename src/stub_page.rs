@@ -23,6 +23,17 @@ use crate::winapis::{NtAllocateVirtualMemory, NtProtectVirtualMemory, NtLockVirt
 
 const PAGE_SIZE: usize = 0x1000; // 4KB
 const MIN_STUB_SIZE: usize = 256; // Stubs total ~200 bytes, 256 gives margin
+const PAGE_EXECUTE: u32 = 0x10;
+const PAGE_EXECUTE_READ_U32: u32 = 0x20;
+const PAGE_EXECUTE_READWRITE_U32: u32 = 0x40;
+const PAGE_EXECUTE_WRITECOPY: u32 = 0x80;
+
+fn is_executable_protection(protect: u32) -> bool {
+    matches!(
+        protect & 0xff,
+        PAGE_EXECUTE | PAGE_EXECUTE_READ_U32 | PAGE_EXECUTE_READWRITE_U32 | PAGE_EXECUTE_WRITECOPY
+    )
+}
 
 /// A page/region that holds multiple executable stubs at sequential offsets.
 ///
@@ -96,6 +107,20 @@ impl StubPage {
             &mut old_protect,
         )) {
             bail!(s!("failed to make image region writable for stubs"));
+        }
+
+        if !is_executable_protection(old_protect) {
+            let mut restore_addr = base;
+            let mut restore_size = size;
+            let mut ignored: u32 = 0;
+            let _ = NtProtectVirtualMemory(
+                NtCurrentProcess(),
+                &mut restore_addr,
+                &mut restore_size,
+                old_protect,
+                &mut ignored,
+            );
+            bail!(s!("image region for stubs is not executable"));
         }
 
         Ok(Self {

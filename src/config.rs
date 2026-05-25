@@ -111,10 +111,12 @@ impl Config {
 
         // Check if an image-backed region was provided (eliminates private RX entirely).
         // Falls back to allocating a private page for standalone testing.
-        let mut stubs = if let Some(&(base, size)) = STUB_IMAGE_REGION.get() {
-            StubPage::from_image_region(base as *mut c_void, size)?
-        } else {
-            StubPage::new()?
+        let mut stubs = match STUB_IMAGE_REGION.get() {
+            Some(&(base, size)) => match StubPage::from_image_region(base as *mut c_void, size) {
+                Ok(stubs) => stubs,
+                Err(_) => StubPage::new()?,
+            },
+            None => StubPage::new()?,
         };
 
         // Write all stubs into the shared page (order doesn't matter)
